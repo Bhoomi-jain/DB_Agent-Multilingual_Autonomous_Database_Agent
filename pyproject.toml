@@ -1,0 +1,25 @@
+[project]
+name = "db-agent-multilingual-autonomous-database-agent"
+version = "0.2.0"
+description = "Multilingual, MCP-based natural language to SQL query agent"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain>=1.2.3",
+    "langchain-community>=0.3.0",
+    "langchain-ollama",
+    "langchain-anthropic",
+    "langchain-mcp-adapters",
+    "mcp[cli]",
+    "mcp-server-sqlite",
+    "langgraph>=1.0.6",
+    "langdetect",
+    "sqlalchemy>=2.0.0",
+    "psycopg2-binary",
+    "pymysql",
+    "sqlglot",
+    "python-dotenv>=1.0.0",
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+dev = []
