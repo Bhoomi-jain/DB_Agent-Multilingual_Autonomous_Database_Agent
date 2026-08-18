@@ -50,11 +50,24 @@ Workflow — follow this every time:
 """
 
 
-def build_llm(provider: str, model: str | None):
+def build_llm(provider: str, model: str | None, reasoning: bool = False, max_tokens: int = 512):
     provider = provider.lower()
     if provider == "ollama":
         from langchain_ollama import ChatOllama
-        return ChatOllama(model=model or "qwen3:4b", temperature=0)
+        return ChatOllama(
+            model=model or "qwen3:4b",
+            temperature=0,
+            # Qwen3 defaults to an extended internal "thinking" pass before
+            # answering — great for hard reasoning problems, mostly wasted
+            # latency for a short SQL-generation/table-picking/formatting
+            # call. reasoning=False maps straight to Ollama's "think": false
+            # API field (confirmed via langchain_ollama source, not just
+            # docs) and skips that pass entirely.
+            reasoning=reasoning,
+            # Caps worst-case generation length so a model that starts
+            # rambling can't turn one call into a multi-minute stall.
+            num_predict=max_tokens,
+        )
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
         if not os.getenv("ANTHROPIC_API_KEY"):
@@ -65,7 +78,7 @@ def build_llm(provider: str, model: str | None):
     raise ValueError(f"Unknown provider '{provider}'. Use 'ollama' or 'anthropic'.")
 
 
-async def build_agent(db_url: str, provider: str, model: str | None):
+async def build_agent(db_url: str, provider: str, model: str | None, reasoning: bool, max_tokens: int):
     dialect = "PostgreSQL" if db_url.startswith("postgresql") else \
               "MySQL" if db_url.startswith("mysql") else "SQL"
 
@@ -79,14 +92,15 @@ async def build_agent(db_url: str, provider: str, model: str | None):
     })
     tools = await client.get_tools()
 
-    llm = build_llm(provider, model)
+    llm = build_llm(provider, model, reasoning=reasoning, max_tokens=max_tokens)
     agent = create_agent(llm, tools, system_prompt=SYSTEM_PROMPT.format(dialect=dialect))
     return agent
 
 
-async def answer_question(question: str, db_url: str, provider: str, model: str | None) -> str:
+async def answer_question(question: str, db_url: str, provider: str, model: str | None,
+                           reasoning: bool = False, max_tokens: int = 512) -> str:
     console.print(f"[dim]Connecting to database via MCP ({provider})...[/dim]")
-    agent = await build_agent(db_url, provider, model)
+    agent = await build_agent(db_url, provider, model, reasoning, max_tokens)
 
     console.print("[dim]Processing query...[/dim]")
     result = await agent.ainvoke({"messages": [{"role": "user", "content": question}]})
@@ -125,6 +139,20 @@ Examples:
         default=os.getenv("LLM_MODEL"),
         help="Override the default model for the chosen provider",
     )
+    parser.add_argument(
+        "--think",
+        action="store_true",
+        help="Enable Qwen3's extended thinking mode (Ollama only). Off by "
+             "default — thinking adds significant latency for little "
+             "benefit on straightforward SQL generation.",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=512,
+        help="Cap on generated tokens per LLM call (Ollama's num_predict). "
+             "Default 512; raise it if answers get cut off.",
+    )
     args = parser.parse_args()
 
     if not args.db_url:
@@ -135,7 +163,10 @@ Examples:
     console.print()
 
     try:
-        answer = asyncio.run(answer_question(args.question, args.db_url, args.provider, args.model))
+        answer = asyncio.run(answer_question(
+            args.question, args.db_url, args.provider, args.model,
+            reasoning=args.think, max_tokens=args.max_tokens,
+        ))
         console.print(Panel(f"[bold green]Answer:[/bold green]\n\n{answer}", border_style="green"))
     except Exception as e:
         console.print(Panel(f"[bold red]Error:[/bold red]\n\n{str(e)}", border_style="red"))
