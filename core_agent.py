@@ -411,6 +411,424 @@ def validate_join_semantics(sql: str, foreign_keys: list, dialect: str = "") -> 
                 )
 
 
+def _fk_graph_and_edges(foreign_keys: list):
+    """Build (adjacency graph, edge->columns map) from the FK list — the
+    same undirected graph structure used for schema bridging, reused here
+    to actually rewrite a bad join rather than just deciding which tables'
+    schemas to show the model."""
+    graph: dict = {}
+    edge_cols: dict = {}
+    for fk in foreign_keys:
+        a, b = fk["table"], fk["references_table"]
+        graph.setdefault(a, set()).add(b)
+        graph.setdefault(b, set()).add(a)
+        for ca, cb in zip(fk["columns"], fk["references_columns"]):
+            edge_cols.setdefault(a, {})[b] = (ca, cb)
+            edge_cols.setdefault(b, {})[a] = (cb, ca)
+    return graph, edge_cols
+
+
+def _bfs_table_path(start: str, goal: str, graph: dict) -> Optional[list]:
+    if start == goal:
+        return [start]
+    visited = {start}
+    queue = [[start]]
+    while queue:
+        path = queue.pop(0)
+        node = path[-1]
+        for neighbor in graph.get(node, ()):
+            if neighbor == goal:
+                return path + [neighbor]
+            if neighbor not in visited:
+                visited.add(neighbor)
+                queue.append(path + [neighbor])
+    return None
+
+
+def repair_join_path(sql: str, foreign_keys: list, dialect: str = "") -> str:
+    """When a JOIN condition doesn't match a real FK relationship (the
+    class of mistake validate_join_semantics rejects), check whether a
+    real multi-hop FK path exists between the two tables via BFS over the
+    actual foreign-key graph — the same graph/BFS logic already used for
+    schema bridging — and if so, rewrite the query to insert the missing
+    intermediate table(s) with correct join conditions, computed entirely
+    from the schema's real relationships. Nothing here is specific to any
+    particular pair of tables; it's the same generic path-finding applied
+    to SQL rewriting instead of just schema selection.
+
+    Deliberately conservative, same as the other repair functions in this
+    file: only rewrites a single top-level SELECT with a simple single-
+    equality ON clause per join; anything more exotic (UNION, WITH,
+    compound ON conditions) is left untouched rather than risking an
+    incorrect rewrite — validate_join_semantics will still catch and
+    clearly report those cases for the normal retry loop to handle."""
+    try:
+        ast = sqlglot.parse_one(sql, read=dialect or None)
+    except Exception:
+        return sql
+
+    if not isinstance(ast, exp.Select):
+        return sql  # only handle simple SELECT; don't guess on UNION/WITH
+
+    aliases = _resolve_table_aliases(ast)
+    fk_pairs = _fk_pairs(foreign_keys)
+    graph, edge_cols = _fk_graph_and_edges(foreign_keys)
+    existing_table_names = {t.name for t in ast.find_all(exp.Table)}
+
+    joins = list(ast.args.get("joins") or [])
+    inserted_joins = []
+    changed = False
+
+    for join in joins:
+        on = join.args.get("on")
+        if on is None:
+            continue
+        eqs = list(on.find_all(exp.EQ))
+        if len(eqs) != 1:
+            continue  # compound ON condition — don't guess which part is the join key
+        left, right = eqs[0].this, eqs[0].expression
+        if not (isinstance(left, exp.Column) and isinstance(right, exp.Column)):
+            continue
+
+        lt = aliases.get(left.table, left.table)
+        rt = aliases.get(right.table, right.table)
+        if not lt or not rt or (lt, left.name, rt, right.name) in fk_pairs:
+            continue  # already valid, or unresolvable — nothing to repair
+
+        path = _bfs_table_path(lt, rt, graph)
+        if not path or len(path) <= 2:
+            continue  # no FK path exists at all — repair can't help; let validation reject it
+
+        # Walk the path, inserting a JOIN for each intermediate table that
+        # isn't already present in the query, chaining each new join off
+        # the previous table in the path using the real FK columns.
+        prev_table, prev_qualifier = lt, left.table
+        ok = True
+        for mid in path[1:-1]:
+            if mid in existing_table_names:
+                # Already joined elsewhere in the query under its own name
+                # — chain through it via its real table name as qualifier.
+                prev_table, prev_qualifier = mid, mid
+                continue
+            if prev_table not in edge_cols or mid not in edge_cols.get(prev_table, {}):
+                ok = False
+                break
+            col_prev, col_mid = edge_cols[prev_table][mid]
+            inserted_joins.append(exp.Join(
+                this=exp.Table(this=exp.to_identifier(mid)),
+                on=exp.EQ(
+                    this=exp.column(col_prev, table=prev_qualifier),
+                    expression=exp.column(col_mid, table=mid),
+                ),
+            ))
+            existing_table_names.add(mid)
+            prev_table, prev_qualifier = mid, mid
+
+        if not ok or prev_table not in edge_cols or rt not in edge_cols.get(prev_table, {}):
+            continue  # couldn't fully resolve every hop — leave this join alone
+
+        col_prev2, col_target = edge_cols[prev_table][rt]
+        join.set("on", exp.EQ(
+            this=exp.column(col_prev2, table=prev_qualifier),
+            expression=exp.column(col_target, table=right.table),
+        ))
+        changed = True
+        logger.info(f"[repair] rebuilt join path {lt} -> {rt} via {' -> '.join(path)}")
+
+    if not changed:
+        return sql
+
+    # Splice the newly-inserted intermediate joins in before the joins list
+    # they support (order among JOIN clauses doesn't affect SQL semantics
+    # as long as every referenced table is declared somewhere in the list).
+    ast.set("joins", inserted_joins + joins)
+    return ast.sql(dialect=dialect or None)
+
+
+# ---------------------------------------------------------------------------
+# Missing-join repair — a FOURTH distinct class of mistake, different from
+# repair_join_path above. repair_join_path fixes a WRONG join edge (two
+# tables joined via columns that aren't a real FK). This handles a table
+# referenced by column (e.g. `COUNT(InvoiceLine.TrackId)`) that was never
+# joined into the query AT ALL — no JOIN clause for it anywhere. This is
+# what let a query silently change from "tracks sold" (needs InvoiceLine)
+# to "tracks in catalog" (doesn't) after a failed attempt: the model
+# resolved a "no such column" error by deleting the InvoiceLine reference
+# entirely instead of adding the join, and nothing caught that the query's
+# meaning had silently changed. Uses the same FK graph/BFS as the other
+# repairs — genuinely computed, not hardcoded to any specific table.
+# ---------------------------------------------------------------------------
+
+def repair_missing_joins(sql: str, foreign_keys: list, table_schemas: dict, dialect: str = "") -> str:
+    """Find column qualifiers that name a REAL table (present in
+    table_schemas) but aren't declared anywhere in FROM/JOIN, and insert
+    the FK-path-shortest JOIN chain connecting it to a table already in the
+    query. Conservative like the other repairs: only acts when a real FK
+    path exists; leaves anything ambiguous or disconnected for
+    validate_all_qualifiers_resolved to flag explicitly."""
+    try:
+        ast = sqlglot.parse_one(sql, read=dialect or None)
+    except Exception:
+        return sql
+    if not isinstance(ast, exp.Select):
+        return sql
+
+    tables = list(ast.find_all(exp.Table))
+    declared = {t.name for t in tables} | {t.alias for t in tables if t.alias}
+    present_real_names = {t.name for t in tables}
+
+    cols = list(ast.find_all(exp.Column))
+    used_qualifiers = {c.table for c in cols if c.table}
+
+    # A qualifier that names a real table in the schema but isn't declared
+    # anywhere in this query — as opposed to a garbage/undefined alias,
+    # which repair_undefined_aliases handles separately.
+    missing = {q for q in used_qualifiers if q not in declared and q in table_schemas}
+    if not missing:
+        return sql
+
+    graph, edge_cols = _fk_graph_and_edges(foreign_keys)
+    joins = list(ast.args.get("joins") or [])
+    inserted = []
+    changed = False
+
+    for missing_table in missing:
+        best_path = None
+        for present in present_real_names:
+            path = _bfs_table_path(present, missing_table, graph)
+            if path and (best_path is None or len(path) < len(best_path)):
+                best_path = path
+        if not best_path or len(best_path) < 2:
+            continue  # no FK connection to anything already in the query
+
+        anchor_name = best_path[0]
+        anchor_qualifier = next(
+            (t.alias or t.name for t in tables if t.name == anchor_name), anchor_name
+        )
+        prev_table, prev_qualifier = anchor_name, anchor_qualifier
+        ok = True
+        for hop in best_path[1:]:
+            # Newly added tables use their real name as qualifier, matching
+            # how they were already referenced in SELECT/WHERE/etc.
+            hop_qualifier = hop
+            if prev_table not in edge_cols or hop not in edge_cols.get(prev_table, {}):
+                ok = False
+                break
+            col_prev, col_hop = edge_cols[prev_table][hop]
+            inserted.append(exp.Join(
+                this=exp.Table(this=exp.to_identifier(hop)),
+                on=exp.EQ(
+                    this=exp.column(col_prev, table=prev_qualifier),
+                    expression=exp.column(col_hop, table=hop_qualifier),
+                ),
+            ))
+            present_real_names.add(hop)
+            prev_table, prev_qualifier = hop, hop_qualifier
+
+        if ok:
+            changed = True
+            logger.info(f"[repair] added missing JOIN for referenced-but-unjoined "
+                        f"table '{missing_table}' via {' -> '.join(best_path)}")
+
+    if not changed:
+        return sql
+
+    ast.set("joins", joins + inserted)
+    return ast.sql(dialect=dialect or None)
+
+
+# ---------------------------------------------------------------------------
+# Tie-aware ranking rewrite — addresses "the agent assumes ORDER BY + LIMIT
+# = correct top-k". A plain LIMIT N is an arbitrary cutoff: if rows N and
+# N+1 are tied on the ranking metric, LIMIT N keeps one and drops the other
+# for no principled reason. The fix is a generic structural SQL rewrite —
+# not specific to any table or query — using RANK() OVER (...) instead of
+# a raw LIMIT, so ties at the boundary are included rather than silently
+# broken. This is standard SQL ranking practice, not a heuristic.
+# ---------------------------------------------------------------------------
+
+def rewrite_top_n_with_ties(sql: str, dialect: str = "") -> str:
+    """Rewrite `... ORDER BY <expr> LIMIT N` into a query using
+    `RANK() OVER (ORDER BY <expr>) AS __rnk` filtered to `__rnk <= N`, so
+    ties at the cutoff are included instead of arbitrarily cut.
+
+    Conservative like the other repairs here: only rewrites when the
+    ORDER BY key is a single, simple identifier (a column or an alias
+    defined in the SELECT list) that the outer window function can safely
+    reference from the wrapped subquery. If the ORDER BY uses a raw
+    unaliased expression (e.g. `ORDER BY SUM(x)` with no output alias for
+    that value), rewriting could produce invalid or incorrect SQL, so this
+    bails out and leaves the original LIMIT-based query untouched rather
+    than risk it — same "don't guess" philosophy as the other repairs."""
+    try:
+        ast = sqlglot.parse_one(sql, read=dialect or None)
+    except Exception:
+        return sql
+    if not isinstance(ast, exp.Select):
+        return sql
+
+    limit_node = ast.args.get("limit")
+    order_node = ast.args.get("order")
+    if limit_node is None or order_node is None:
+        return sql
+
+    order_expressions = order_node.expressions
+    if len(order_expressions) != 1:
+        return sql  # multi-key ORDER BY — don't guess how ties interact across keys
+
+    try:
+        n = int(str(limit_node.expression.this))
+    except (AttributeError, ValueError):
+        return sql  # non-literal LIMIT (e.g. a bound parameter) — leave alone
+
+    order_col = order_expressions[0].this
+    if not isinstance(order_col, exp.Column):
+        return sql  # not a simple column/alias reference — bail out, don't guess
+
+    order_key = order_col.name
+
+    def _output_name(e):
+        if isinstance(e, exp.Alias):
+            return e.alias
+        if isinstance(e, exp.Column):
+            return e.name  # e itself IS the column for a bare "SELECT revenue"
+        return None
+
+    select_aliases = {_output_name(e) for e in ast.expressions}
+    select_aliases.discard(None)
+    if order_key not in select_aliases:
+        return sql  # ORDER BY key isn't exposed as an output column of this
+        # query — the outer window function couldn't reference it after
+        # wrapping, so don't attempt the rewrite
+
+    order_by_sql = order_node.sql(dialect=dialect or None)
+    order_by_expr = re.sub(r"(?i)^order by\s+", "", order_by_sql)
+
+    inner = ast.copy()
+    inner.set("limit", None)
+    inner.set("order", None)
+    inner_sql = inner.sql(dialect=dialect or None)
+
+    wrapped = (
+        f"SELECT * FROM ("
+        f"SELECT sub.*, RANK() OVER (ORDER BY {order_by_expr}) AS __rnk "
+        f"FROM ({inner_sql}) AS sub"
+        f") AS ranked WHERE __rnk <= {n} ORDER BY __rnk"
+    )
+
+    try:
+        reparsed = sqlglot.parse_one(wrapped, read=dialect or None)
+        return reparsed.sql(dialect=dialect or None)
+    except Exception:
+        return sql  # rewrite didn't produce valid SQL — don't risk it
+
+
+def validate_all_qualifiers_resolved(sql: str, dialect: str = "") -> None:
+    """Stricter semantic check, run AFTER the repair functions above.
+    validate_join_semantics only checks that EXISTING JOIN conditions in
+    the query are real FK relationships — it says nothing about whether a
+    referenced table was joined at all. This closes that gap: every column
+    qualifier used anywhere in the query (SELECT, WHERE, GROUP BY, ORDER
+    BY, inside aggregate functions, ...) must resolve to a table or alias
+    actually declared in FROM/JOIN. Anything still unresolved at this point
+    is genuinely unfixable automatically (repair_missing_joins already had
+    its chance) and needs a real LLM retry with a specific, actionable
+    error rather than a cryptic database-level failure."""
+    try:
+        ast = sqlglot.parse_one(sql, read=dialect or None)
+    except Exception:
+        return  # unparseable SQL is validate_readonly's job, not this
+
+    if not isinstance(ast, exp.Select):
+        return  # only enforced on simple SELECT, consistent with the repairs above
+
+    tables = list(ast.find_all(exp.Table))
+    declared = {t.name for t in tables} | {t.alias for t in tables if t.alias}
+
+    cols = list(ast.find_all(exp.Column))
+    used_qualifiers = {c.table for c in cols if c.table}
+    unresolved = used_qualifiers - declared
+
+    if unresolved:
+        raise SemanticValidationError(
+            f"Column qualifier(s) {sorted(unresolved)} are referenced in the "
+            f"query but no matching table appears anywhere in FROM/JOIN. ADD "
+            f"a JOIN clause for the missing table(s) — do NOT remove the "
+            f"column reference, and do NOT change what the query measures "
+            f"just to make the error go away."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Grouping-intent validation — a FIFTH distinct class of mistake, and a
+# different KIND of bug from everything above: those all caught SQL that
+# was structurally broken (wrong join, missing join, undeclared alias).
+# This one is structurally FINE — it runs, it returns a plausible-looking
+# number — but the number answers a different question than the one asked.
+# A classic text-to-SQL failure: "average invoice total per customer"
+# matches "average" + "invoice total" but drops "per customer", producing
+# a single ungrouped AVG() across every invoice instead of one average per
+# customer. The answer_verification step can't catch this — the number IS
+# real, pulled straight from a real query result. Only checking the
+# QUESTION's language against the SQL's STRUCTURE can catch it.
+# ---------------------------------------------------------------------------
+
+_GROUPING_INTENT_PATTERNS = [
+    re.compile(r"\bper\s+(\w+)", re.IGNORECASE),
+    re.compile(r"\bfor each\s+(\w+)", re.IGNORECASE),
+    re.compile(r"\beach\s+(\w+)", re.IGNORECASE),
+    re.compile(r"\bby\s+(\w+)\s*(?:,|and\b|$)", re.IGNORECASE),
+]
+
+
+def _grouping_intent_terms(question: str) -> list:
+    """Extract the noun following a grouping-intent phrase ('per customer'
+    -> 'customer'), for both detection and building an actionable error
+    message. Not schema-aware by design — matching is purely on the
+    question's language; the caller decides what to do with the term."""
+    terms = []
+    for pattern in _GROUPING_INTENT_PATTERNS:
+        for m in pattern.finditer(question):
+            terms.append(m.group(1))
+    return terms
+
+
+def validate_grouping_intent(question: str, sql: str, dialect: str = "") -> None:
+    """If the question uses 'per X' / 'for each X' / 'by X' language
+    (implying one result row per X), but the query aggregates WITHOUT a
+    GROUP BY at all, that's almost certainly wrong — an ungrouped aggregate
+    collapses everything into a single row, contradicting a per-entity
+    breakdown. Doesn't attempt to guess or auto-repair which column to
+    group by (too easy to guess wrong and silently produce a different
+    mistake); raises with the specific term detected so the retry prompt
+    can point the model at exactly what was missed."""
+    terms = _grouping_intent_terms(question)
+    if not terms:
+        return
+
+    try:
+        ast = sqlglot.parse_one(sql, read=dialect or None)
+    except Exception:
+        return  # unparseable SQL is validate_readonly's job, not this
+    if not isinstance(ast, exp.Select):
+        return
+
+    has_aggregate = any(
+        isinstance(n, (exp.Sum, exp.Avg, exp.Count, exp.Min, exp.Max))
+        for n in ast.walk()
+    )
+    has_group_by = ast.args.get("group") is not None
+
+    if has_aggregate and not has_group_by:
+        raise SemanticValidationError(
+            f"The question says \"{terms[0]}\" — implying one result per "
+            f"{terms[0]}, e.g. \"per customer\" means one row per customer "
+            f"— but the query aggregates with NO GROUP BY at all, which "
+            f"collapses everything into a single overall value instead. "
+            f"Add a GROUP BY on the column that corresponds to \"{terms[0]}\"."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Answer verification — a best-effort check that the FINAL ANSWER TEXT
 # actually reflects the query results, rather than the model editorializing,
@@ -431,10 +849,14 @@ def _strip_list_markers(text: str) -> str:
 
 def _extract_numbers(text: str) -> set:
     text = _strip_list_markers(text)
+    # Negative lookbehind/lookahead for a letter excludes digits embedded in
+    # an alphanumeric token (e.g. the "2" in "U2", a real band name) from
+    # being treated as a data figure to verify — a real observed false
+    # positive that flagged a correct answer as unverified.
     # rstrip('.') handles any remaining trailing punctuation — a real
     # decimal like "49.62" is unaffected since \d* already consumed the
     # digits after the dot, so there's no trailing "." left to strip.
-    return {n.rstrip(".") for n in re.findall(r"-?\d+\.?\d*", text)}
+    return {n.rstrip(".") for n in re.findall(r"(?<![A-Za-z])-?\d+\.?\d*(?![A-Za-z])", text)}
 
 
 def _extract_numbers_from_rows(result: dict) -> set:
@@ -457,6 +879,76 @@ def verify_answer(answer: str, result: dict) -> list:
     answer_nums = _extract_numbers(answer)
     row_nums = _extract_numbers_from_rows(result)
     return sorted(answer_nums - row_nums)
+
+
+# ---------------------------------------------------------------------------
+# Alias repair — a THIRD distinct class of mistake from dialect syntax
+# (extract_sql's _try_repair) and join semantics (validate_join_semantics).
+# This one is subtler: the query parses fine and every JOIN is a real FK
+# relationship, but SELECT/GROUP BY/ORDER BY reference a table alias (e.g.
+# "A.Name") that was NEVER declared in FROM/JOIN ("JOIN Artist ON ..." with
+# no "AS A"). sqlglot's parser doesn't do identifier resolution, so this
+# passes both earlier validators cleanly and only fails at the database —
+# and in practice, error-message retries didn't fix it (the model repeated
+# the identical mistake three times). This repairs it deterministically
+# instead of hoping the model self-corrects.
+# ---------------------------------------------------------------------------
+
+def repair_undefined_aliases(sql: str, dialect: str, table_schemas: dict) -> str:
+    """If a column qualifier (e.g. the "A" in "A.Name") isn't declared as
+    any real table name or alias in FROM/JOIN, try to identify which
+    un-aliased table it was meant to refer to and attach that alias to it.
+    Disambiguation is two-stage: first by actual column membership (which
+    candidate table's real schema contains every column referenced under
+    that qualifier — authoritative, since we already fetched real schemas),
+    then, if still ambiguous, by name-prefix match. Only applies the fix
+    when exactly one candidate remains; never guesses under real ambiguity."""
+    try:
+        ast = sqlglot.parse_one(sql, read=dialect or None)
+    except Exception:
+        return sql
+
+    tables = list(ast.find_all(exp.Table))
+    declared = {t.name for t in tables} | {t.alias for t in tables if t.alias}
+
+    cols = list(ast.find_all(exp.Column))
+    used_qualifiers = {c.table for c in cols if c.table}
+    undefined = used_qualifiers - declared
+    if not undefined:
+        return sql
+
+    changed = False
+    for qualifier in undefined:
+        referenced_cols = {c.name for c in cols if c.table == qualifier}
+        candidates = [t for t in tables if not t.alias]
+
+        matches = [
+            t for t in candidates
+            if referenced_cols.issubset({c["name"] for c in table_schemas.get(t.name, [])})
+        ]
+        if len(matches) > 1:
+            narrowed = [t for t in matches if t.name.lower().startswith(qualifier.lower())]
+            if len(narrowed) == 1:
+                matches = narrowed
+
+        if len(matches) == 1:
+            table_node = matches[0]
+            original_name = table_node.name
+            table_node.set("alias", exp.TableAlias(this=exp.to_identifier(qualifier)))
+            changed = True
+            # Once a table has an alias, some engines (SQLite included)
+            # reject any further reference to it by its original bare
+            # name — the whole query has to consistently use the alias.
+            # Rewrite every other column reference that used the original
+            # table name so the repaired query is actually internally
+            # consistent, not just individually parseable.
+            for c in cols:
+                if c.table == original_name:
+                    c.set("table", exp.to_identifier(qualifier))
+            logger.info(f"[repair] undeclared alias '{qualifier}' resolved to "
+                        f"table '{original_name}' and repaired")
+
+    return ast.sql(dialect=dialect or None) if changed else sql
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +1112,15 @@ class SQLAgent:
     # ---- Step 3: generate SQL ----
     async def generate_sql(self, question: str, schema_context: str, error_context: str = "") -> str:
         retry_note = (
-            f"\n\nThe previous attempt failed — fix this exact error:\n{error_context}"
+            f"\n\nThe previous attempt failed — fix this exact error:\n{error_context}\n"
+            "IMPORTANT: fix the error by correcting the query's STRUCTURE "
+            "(e.g. add the missing JOIN clause for a table that error "
+            "mentions). Do NOT fix it by deleting or simplifying away the "
+            "part of the query that caused the error — that changes what "
+            "the query measures and produces a wrong answer that runs "
+            "without error. If a column from table X caused the error, the "
+            "fix is almost always \"join table X correctly\", not \"stop "
+            "using table X\"."
             if error_context else ""
         )
         prompt = (
@@ -787,6 +1287,17 @@ class SQLAgent:
             # Step 6: explicit, bounded retry loop
             for attempt in range(self.max_retries + 1):
                 sql = await self.generate_sql(question, schema_context, error_context)
+                # Deterministic alias repair — fixes a real, observed
+                # failure (undeclared "A."/"T." aliases) that error-message
+                # retries alone did not fix even after 3 identical attempts.
+                sql = repair_undefined_aliases(sql, _sqlglot_dialect(self.dialect), table_schemas)
+                # Deterministic missing-join repair — fixes a table
+                # referenced by column (e.g. an aggregate over
+                # InvoiceLine.TrackId) that was never joined into the query
+                # at all. Runs BEFORE join-semantics validation below so
+                # that by the time that check runs, every referenced table
+                # is actually present.
+                sql = repair_missing_joins(sql, foreign_keys, table_schemas, _sqlglot_dialect(self.dialect))
                 try:
                     self.validate_sql(sql)
                     # Semantic/FK validation — a DIFFERENT check from
@@ -802,7 +1313,46 @@ class SQLAgent:
                         validate_join_semantics(sql, foreign_keys, _sqlglot_dialect(self.dialect))
                     except SemanticValidationError as e:
                         self.metrics.semantic_rejections += 1
-                        raise
+                        # Before giving up on this attempt (and burning a
+                        # full LLM retry), check whether a real FK path
+                        # exists between the two tables via BFS over the FK
+                        # graph — computed generically, not hardcoded to
+                        # any specific pair — and if so, deterministically
+                        # rewrite the query to route through the correct
+                        # intermediate table(s) instead of hoping the model
+                        # figures out a multi-hop join itself.
+                        repaired = repair_join_path(sql, foreign_keys, _sqlglot_dialect(self.dialect))
+                        if repaired == sql:
+                            raise  # nothing we could deterministically fix
+                        sql = repaired
+                        self.validate_sql(sql)
+                        validate_join_semantics(sql, foreign_keys, _sqlglot_dialect(self.dialect))
+                    # Stricter check, run last: catches anything STILL
+                    # referencing a table that isn't actually joined —
+                    # repair_missing_joins already had its chance above, so
+                    # anything flagged here is genuinely unfixable
+                    # automatically (e.g. no FK path connects it to
+                    # anything in the query) and needs a real LLM retry
+                    # with a specific, actionable error.
+                    validate_all_qualifiers_resolved(sql, _sqlglot_dialect(self.dialect))
+                    # Grouping-intent check — a DIFFERENT kind of bug from
+                    # everything above: this SQL is structurally fine, but
+                    # answers a different question than what was asked
+                    # (e.g. "average X per customer" without a GROUP BY).
+                    # No auto-repair here — guessing the wrong grouping
+                    # column would just trade one silent mistake for
+                    # another — but a specific, actionable error forces a
+                    # real retry instead of shipping a plausible wrong number.
+                    validate_grouping_intent(question, sql, _sqlglot_dialect(self.dialect))
+                    # Tie-aware ranking rewrite — applied LAST, only after
+                    # every validation above has confirmed the flat query is
+                    # correct. This wraps the query in a subquery (RANK()
+                    # OVER (...) WHERE rnk <= N), and none of the validators
+                    # above understand derived-table aliases — validating
+                    # the simple pre-rewrite query first and treating this
+                    # rewrite as a trusted final mechanical transform avoids
+                    # that whole class of false rejection.
+                    sql = rewrite_top_n_with_ties(sql, _sqlglot_dialect(self.dialect))
                     result = await self.execute_sql(sql)
                     last_error = None
                     break
