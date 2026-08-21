@@ -865,6 +865,16 @@ def _extract_numbers_from_rows(result: dict) -> set:
         for val in row:
             if isinstance(val, (int, float)):
                 nums.add(str(val))
+            elif isinstance(val, str):
+                # MCP's JSON serialization turns non-JSON-native types (e.g.
+                # Postgres Decimal/NUMERIC results) into strings — a real
+                # observed bug: "59.88" arrived as a string, not a float,
+                # and was silently never matched against the answer text.
+                try:
+                    float(val)
+                    nums.add(val)
+                except ValueError:
+                    pass
     # The row count itself is a legitimate, commonly-stated fact ("there
     # are N results") even when it isn't a literal cell value anywhere.
     nums.add(str(len(result.get("rows", []))))

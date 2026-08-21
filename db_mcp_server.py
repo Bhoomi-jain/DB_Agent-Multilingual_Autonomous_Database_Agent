@@ -21,7 +21,7 @@ Exposed tools:
   - list_tables()                 -> table names in the connected database
   - describe_table(table_name)    -> columns, types, nullability, PK
   - list_foreign_keys(table_name) -> FK relationships (omit table_name for all)
-  - run_query(query)              -> execute a read-only SELECT, capped rows
+  - run_query(query)              -> execute a read-only SELECT, capped rowsp
 
 Usage:
   python db_mcp_server.py --db-url postgresql+psycopg2://user:pass@host/db

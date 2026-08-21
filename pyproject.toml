@@ -17,6 +17,9 @@ dependencies = [
     "psycopg2-binary",
     "pymysql",
     "sqlglot",
+    "chromadb",
+    "scikit-learn",
+    "httpx",
     "python-dotenv>=1.0.0",
     "rich>=13.0.0",
 ]

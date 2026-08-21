@@ -37,7 +37,7 @@ class FakeMsg:
 class FakeLLM:
     def __init__(self, responses):
         self.responses = list(responses)
-
+        self.prompts = []
     async def ainvoke(self, prompt):
         return FakeMsg(self.responses.pop(0))
 
