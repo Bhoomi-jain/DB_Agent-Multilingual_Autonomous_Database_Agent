@@ -1,5 +1,10 @@
 import asyncio
+
+import sqlglot
+from sqlglot import exp
+
 from core_agent import SQLAgent
+from db_targets import PG_URL
 
 
 class FakeMsg:
@@ -33,7 +38,7 @@ async def main():
         "Alice has the most items.",  # format_answer
     ])
     agent = SQLAgent(
-        db_url="postgresql+psycopg2://postgres:postgres@localhost/testdb",
+        db_url=PG_URL,
         llm=llm, dialect="PostgreSQL", max_retries=2, use_cache=False,
     )
     answer, sql, metrics = await agent.run("Which customer has ordered the most items?")
@@ -42,7 +47,16 @@ async def main():
     print("REPAIRED SQL:", " ".join(sql.split()))
     print(metrics.summary())
 
-    assert "orders" in sql, "the missing bridge table should have been inserted"
+    # AST-based, not substring-based: `assert "orders" in sql` was trivially
+    # true even WITHOUT repair — "order_items" contains the substring
+    # "orders". The real contract is that a JOIN clause for the orders table
+    # exists in the final query tree.
+    ast = sqlglot.parse_one(sql, read="postgres")
+    joined_tables = [j.this.name for j in ast.find_all(exp.Join) if isinstance(j.this, exp.Table)]
+    assert "orders" in joined_tables, (
+        f"the bridge table 'orders' should have been inserted as an actual "
+        f"JOIN by join-path repair; joins found: {joined_tables}"
+    )
     assert metrics.semantic_rejections == 1, "semantic validation should have caught the bad join"
     assert metrics.retries == 0, (
         f"expected 0 retries — join-path repair should fix this WITHIN the "

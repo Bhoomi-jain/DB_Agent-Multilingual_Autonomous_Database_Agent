@@ -1,5 +1,6 @@
 import asyncio
 from core_agent import SQLAgent
+from db_targets import PG_URL
 
 
 class FakeMsg:
@@ -32,7 +33,7 @@ async def main():
         "Alice is the customer from Canada.",
     ])
     agent = SQLAgent(
-        db_url="postgresql+psycopg2://postgres:postgres@localhost/testdb",
+        db_url=PG_URL,
         llm=llm, dialect="PostgreSQL", max_retries=1, use_cache=False,
     )
     answer, sql, metrics = await agent.run("Which customers are from Canada?")

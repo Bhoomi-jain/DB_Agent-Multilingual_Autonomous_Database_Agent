@@ -1,5 +1,6 @@
 import asyncio
 from core_agent import SQLAgent
+from db_targets import PG_URL
 
 
 class FakeMsg:
@@ -36,7 +37,7 @@ async def main():
         "Here is the average order ID per customer.",  # format_answer
     ])
     agent = SQLAgent(
-        db_url="postgresql+psycopg2://postgres:postgres@localhost/testdb",
+        db_url=PG_URL,
         llm=llm, dialect="PostgreSQL", max_retries=1, use_cache=False,
     )
     answer, sql, metrics = await agent.run("What is the average order ID per customer?")

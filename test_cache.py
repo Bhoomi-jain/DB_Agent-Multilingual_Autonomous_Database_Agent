@@ -1,5 +1,6 @@
 import asyncio
 from core_agent import SQLAgent
+from db_targets import pick_backend
 
 
 class FakeMsg:
@@ -25,6 +26,14 @@ GROUP BY c.name
 ORDER BY revenue DESC
 ```"""
 
+# The caching assertions below (5 misses on the first run; 5 hits + a single
+# tool call on the second) exercise SchemaCache, not any particular backend —
+# the schema shape is identical on any engine with the three baseline tables.
+# pick_backend() (in db_targets.py) prefers MySQL when its server is up and
+# falls back to the Postgres testdb the rest of the suite uses otherwise,
+# rather than failing this test on a missing server. GOOD_SQL is portable
+# across both.
+
 
 async def run_once(db_url, dialect):
     llm = FakeLLM([GOOD_SQL, "Alice generated the most revenue."])
@@ -34,18 +43,18 @@ async def run_once(db_url, dialect):
 
 
 async def main():
-    db_url = "mysql+pymysql://root:rootpass@127.0.0.1/testdb"
+    db_url, dialect, label = pick_backend()
 
-    print("=== MySQL: first run (expect cache MISSES) ===")
-    answer1, m1 = await run_once(db_url, "MySQL")
+    print(f"=== {label}: first run (expect cache MISSES) ===")
+    answer1, m1 = await run_once(db_url, dialect)
     print("answer:", answer1)
     print(m1.summary())
     # Fine-grained caching: get_tables + 3x describe_table + get_foreign_keys = 5 misses
     assert m1.cache_misses == 5 and m1.cache_hits == 0
     assert m1.tool_calls >= 5  # list_tables + 3x describe_table + list_foreign_keys + run_query
 
-    print("\n=== MySQL: second run (expect cache HIT, fewer tool calls) ===")
-    answer2, m2 = await run_once(db_url, "MySQL")
+    print(f"\n=== {label}: second run (expect cache HIT, fewer tool calls) ===")
+    answer2, m2 = await run_once(db_url, dialect)
     print("answer:", answer2)
     print(m2.summary())
     # 5 hits now: get_tables + 3x describe_table + get_foreign_keys, all from cache

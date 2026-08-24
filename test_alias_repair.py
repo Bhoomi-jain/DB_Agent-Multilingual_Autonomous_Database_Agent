@@ -1,5 +1,10 @@
 import asyncio
+
+import sqlglot
+from sqlglot import exp
+
 from core_agent import SQLAgent
+from db_targets import PG_URL
 
 
 class FakeMsg:
@@ -34,7 +39,7 @@ async def main():
         "Alice has ordered the most items.",  # format_answer
     ])
     agent = SQLAgent(
-        db_url="postgresql+psycopg2://postgres:postgres@localhost/testdb",
+        db_url=PG_URL,
         llm=llm, dialect="PostgreSQL", max_retries=2, use_cache=False,
     )
     answer, sql, metrics = await agent.run("Which customer has ordered the most items?")
@@ -47,7 +52,16 @@ async def main():
         f"expected 0 retries — repair should fix this on the FIRST attempt, "
         f"got {metrics.retries} retries (same as the unrepaired real failure)"
     )
-    assert "AS C" in sql or "customers AS C" in sql
+    # AST-based, not substring-based: "AS C" appears in unrelated places
+    # (e.g. "COUNT(...) AS CustomerName") and cosmetic refactors of the
+    # generated SQL would break a string match. The real contract is that
+    # C and OI are DECLARED aliases in FROM/JOIN after repair.
+    ast = sqlglot.parse_one(sql, read="postgres")
+    declared_aliases = {t.alias for t in ast.find_all(exp.Table) if t.alias}
+    assert {"C", "OI"}.issubset(declared_aliases), (
+        f"aliases C and OI should both be declared in FROM/JOIN after repair; "
+        f"declared: {sorted(declared_aliases)}"
+    )
 
     print("\n--- undeclared-alias repair succeeded on first attempt, no retry "
           "needed (the real bug retried 3x identically without this fix) ---")

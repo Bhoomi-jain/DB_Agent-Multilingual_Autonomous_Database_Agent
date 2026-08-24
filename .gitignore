@@ -3,6 +3,11 @@
 
 # Database
 chinook.db
+test_sqlite.db
+
+# Runtime artifacts
+.schema_cache.json
+test_report.txt
 
 # Virtual environment
 .venv/

@@ -1,5 +1,6 @@
 import asyncio
 from core_agent import SQLAgent
+from db_targets import PG_URL
 
 
 class FakeMsg:
@@ -45,7 +46,7 @@ responses = [
 async def main():
     llm = FakeLLM(responses)
     agent = SQLAgent(
-        db_url="postgresql+psycopg2://postgres:postgres@localhost/testdb",
+        db_url=PG_URL,
         llm=llm, dialect="PostgreSQL", max_retries=2, use_cache=True,
     )
     answer, sql, metrics = await agent.run("Which customer generated the most revenue?")

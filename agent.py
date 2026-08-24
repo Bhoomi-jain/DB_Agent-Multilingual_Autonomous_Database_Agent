@@ -1,6 +1,20 @@
 """
 DB-Agent — Multilingual Autonomous Database Agent
 
+DEPRECATED: this was the original v0.1 entry point, built on LangChain's
+create_agent() ReAct loop and the archived upstream mcp-server-sqlite
+package. The engine it wrapped has been superseded by core_agent.py
+(explicit control loop: schema filtering, FK-aware validation/repair,
+bounded retries, answer verification — none of which this file has), and
+the multilingual pipeline that lived only here has been ported forward:
+
+    python multilingual.py "¿Cuántos clientes hay?" --db-url sqlite:///chinook.db
+
+This file remains as a historical reference for the original architecture.
+Nothing else imports it.
+
+---
+
 Connects to a SQLite database through the official `mcp-server-sqlite`
 Model Context Protocol server (rather than talking to the DB directly),
 and answers natural-language questions in whatever language they're asked.

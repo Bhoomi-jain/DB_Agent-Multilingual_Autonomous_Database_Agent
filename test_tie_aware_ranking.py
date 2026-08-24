@@ -2,7 +2,7 @@ import asyncio
 from core_agent import SQLAgent
 from sqlalchemy import create_engine, text
 
-DB_URL = "postgresql+psycopg2://postgres:postgres@localhost/testdb"
+from db_targets import PG_URL as DB_URL
 
 
 def setup_tie_scenario():
@@ -51,7 +51,7 @@ async def main():
     setup_tie_scenario()
     try:
         llm = FakeLLM([
-            '["product_sales"]',  # pick_relevant_tables (4 tables total now, >3 threshold)
+            '{"tables": ["product_sales"]}',  # pick_relevant_tables (4 tables total now, >3 threshold)
             TOP5_SQL,
             "Here are the top products by revenue.",
         ])

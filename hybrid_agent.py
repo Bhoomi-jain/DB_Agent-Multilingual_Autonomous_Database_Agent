@@ -38,7 +38,14 @@ from vector_store import VectorStore, build_embedding_function
 load_dotenv()
 console = Console()
 
-DEFAULT_DISTANCE_THRESHOLD = 1.2  # matches worse than this are treated as "not actually relevant"
+DEFAULT_DISTANCE_THRESHOLD = 1.0  # cosine distance: 0=identical, 1=orthogonal/unrelated, 2=opposite.
+# Meaningful and portable across embedding providers ONLY because
+# VectorStore now forces cosine distance explicitly — chromadb's default
+# (squared L2) scales with the embedding vectors' raw magnitude, and a
+# fixed threshold under L2 is meaningless across different embedding
+# models (verified: real dense-model-shaped vectors produced L2 distances
+# in the thousands against this same threshold, silently filtering out
+# every match — see VectorStore's docstring for the fix).
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +114,23 @@ class HybridAgent:
                                       metadata_fields=metadata_fields)
 
     def semantic_search(self, query: str) -> list[dict]:
-        matches = self.vector_store.search(query, top_k=self.top_k)
-        return [m for m in matches if m["distance"] <= self.distance_threshold]
+        all_matches = self.vector_store.search(query, top_k=self.top_k)
+        filtered = [m for m in all_matches if m["distance"] <= self.distance_threshold]
+        if not filtered and all_matches:
+            # Diagnostic, not silence: show the closest match(es) found even
+            # though none passed the threshold, so a genuine "nothing is
+            # actually relevant" result is distinguishable from "the
+            # threshold is miscalibrated for this embedding backend" — the
+            # exact ambiguity that made the original distance-scale bug
+            # hard to debug from the CLI output alone.
+            best = all_matches[0]
+            console.print(
+                f"[dim]No matches within distance_threshold={self.distance_threshold} "
+                f"— closest was '{best.get('name', best['id'])}' at distance "
+                f"{best['distance']:.3f}. If this looks like it SHOULD match, "
+                f"try a higher --distance-threshold.[/dim]"
+            )
+        return filtered
 
     async def run(self, question: str):
         route = await classify_question(self.llm, question)

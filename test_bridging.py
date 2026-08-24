@@ -2,7 +2,7 @@ import asyncio
 from core_agent import SQLAgent
 from sqlalchemy import create_engine, text
 
-DB_URL = "postgresql+psycopg2://postgres:postgres@localhost/testdb"
+from db_targets import PG_URL as DB_URL
 
 
 def setup():
@@ -56,7 +56,7 @@ async def main():
     setup()
     try:
         llm = FakeLLM([
-            '["customers", "shipments"]',  # pick_relevant_tables: skips the bridge table 'orders'
+            '{"tables": ["customers", "shipments"]}',  # pick_relevant_tables: skips the bridge table 'orders'
             GOOD_SQL,                        # generate_sql
             "Alice and Chen had orders shipped via UPS.",  # format_answer
         ])

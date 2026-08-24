@@ -123,8 +123,23 @@ class VectorStore:
             self._client.delete_collection(collection_name)
         except Exception:
             pass
+        # Explicit cosine distance, NOT chromadb's default (squared L2).
+        # L2 distance scales with the embedding vectors' raw magnitude —
+        # our TF-IDF+SVD vectors happen to be small-magnitude (distances
+        # mostly 0.2-1.2, which is where DEFAULT_DISTANCE_THRESHOLD was
+        # calibrated), but a real dense model like nomic-embed-text can
+        # return non-normalized vectors with L2 distances in the THOUSANDS
+        # — any fixed threshold under default L2 space would be meaningless
+        # across different embedding providers/models. Cosine distance is
+        # scale-independent and always bounded in [0, 2] (0=identical
+        # direction, 1=orthogonal, 2=opposite) regardless of embedding
+        # magnitude, so one threshold default is actually meaningful across
+        # providers. Verified: a large-magnitude synthetic embedder
+        # produced L2 distances of ~30,000 but cosine distances correctly
+        # bounded in [0,2].
         self._collection = self._client.create_collection(
-            name=collection_name, embedding_function=embedding_function
+            name=collection_name, embedding_function=embedding_function,
+            metadata={"hnsw:space": "cosine"},
         )
 
     def index_rows(self, rows: list[dict], id_field: str, text_field: str, metadata_fields: Optional[list[str]] = None):

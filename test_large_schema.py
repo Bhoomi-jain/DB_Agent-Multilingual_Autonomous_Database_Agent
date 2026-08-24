@@ -2,7 +2,8 @@ import asyncio
 from sqlalchemy import create_engine, text
 from core_agent import SQLAgent
 
-DB_URL = "postgresql+psycopg2://postgres:postgres@localhost/testdb"
+from db_targets import PG_URL as DB_URL
+
 EXTRA_TABLES = [f"artist_extra_{i}" for i in range(1, 8)]  # 7 unrelated tables
 
 
@@ -51,7 +52,9 @@ ORDER BY revenue DESC
 ```"""
 
 responses = [
-    '["customers", "orders", "order_items"]',  # 1. pick_relevant_tables (10 tables > 3, so this LLM call happens)
+    # 1. pick_relevant_tables + query plan (10 tables > 3, so this LLM call
+    #    happens) — plan-object format since the merged plan call.
+    '{"tables": ["customers", "orders", "order_items"]}',
     GOOD_SQL,                                    # 2. generate_sql
     "Alice generated the most revenue.",         # 3. format_answer
 ]
@@ -62,7 +65,7 @@ async def main():
     try:
         llm = FakeLLM(responses)
         agent = SQLAgent(
-            db_url="postgresql+psycopg2://postgres:postgres@localhost/testdb",
+            db_url=DB_URL,
             llm=llm, dialect="PostgreSQL", max_retries=1, use_cache=False,
         )
         answer, sql, metrics = await agent.run("Which customer generated the most revenue?")

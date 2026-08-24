@@ -55,14 +55,13 @@ def build_llm(provider: str, model: str | None, reasoning: bool = False, max_tok
     if provider == "ollama":
         from langchain_ollama import ChatOllama
         return ChatOllama(
-            model=model or "qwen3:4b",
+            model=model or "llama3.2:latest",
             temperature=0,
-            # Qwen3 defaults to an extended internal "thinking" pass before
-            # answering — great for hard reasoning problems, mostly wasted
-            # latency for a short SQL-generation/table-picking/formatting
-            # call. reasoning=False maps straight to Ollama's "think": false
-            # API field (confirmed via langchain_ollama source, not just
-            # docs) and skips that pass entirely.
+            # reasoning=False maps to Ollama's "think": false API field, but
+            # whether the model HONORS it is model-dependent: thinking models
+            # like Qwen3 have been observed emitting <think> reasoning anyway
+            # (stripped defensively in core_agent._strip_thinking), while
+            # Llama 3.2 has no thinking mode at all and ignores it harmlessly.
             reasoning=reasoning,
             # Caps worst-case generation length so a model that starts
             # rambling can't turn one call into a multi-minute stall.
@@ -142,7 +141,9 @@ Examples:
     parser.add_argument(
         "--think",
         action="store_true",
-        help="Enable Qwen3's extended thinking mode (Ollama only). Off by "
+        help="Request the model's extended 'thinking' mode (Ollama only). "
+             "Model-dependent: honored by some models (e.g. Qwen3), ignored "
+             "by others (e.g. Llama 3.2, which has no thinking mode). Off by "
              "default — thinking adds significant latency for little "
              "benefit on straightforward SQL generation.",
     )

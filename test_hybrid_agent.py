@@ -1,8 +1,9 @@
 import asyncio
 from sqlalchemy import create_engine, text
+
 from hybrid_agent import HybridAgent
 
-DB_URL = "postgresql+psycopg2://postgres:postgres@localhost/testdb"
+from db_targets import PG_URL as DB_URL
 
 
 def setup():
@@ -79,9 +80,6 @@ class FakeLLM:
         return FakeMsg(self.responses.pop(0))
 
 
-DB_URL = "postgresql+psycopg2://postgres:postgres@localhost/testdb"
-
-
 def make_agent(llm):
     return HybridAgent(
         DB_URL, llm, "PostgreSQL",
@@ -95,7 +93,7 @@ async def test_sql_route():
     print("=== Route: SQL (pure structured question) ===")
     llm = FakeLLM([
         "SQL",  # classify
-        '["products"]',  # pick_relevant_tables (4 tables now, >3 threshold)
+        '{"tables": ["products"]}',  # pick_relevant_tables (4 tables now, >3 threshold)
         "```sql\nSELECT COUNT(*) AS n FROM products\n```",  # generate_sql
         "There are 6 products.",  # format_answer
     ])
@@ -133,7 +131,7 @@ async def test_hybrid_route():
     print("=== Route: HYBRID (semantic filter -> SQL aggregate) ===")
     llm = FakeLLM([
         "HYBRID",  # classify
-        '["order_items"]',  # pick_relevant_tables
+        '{"tables": ["order_items"]}',  # pick_relevant_tables
         # generate_sql: model correctly uses the product_id constraint
         # injected into the augmented question
         "```sql\n"

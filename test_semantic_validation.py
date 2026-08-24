@@ -2,7 +2,7 @@ import asyncio
 from core_agent import SQLAgent
 from sqlalchemy import create_engine, text
 
-DB_URL = "postgresql+psycopg2://postgres:postgres@localhost/testdb"
+from db_targets import PG_URL as DB_URL
 
 
 def setup_isolated_table():
@@ -59,7 +59,7 @@ async def main():
     setup_isolated_table()
     try:
         llm = FakeLLM([
-            '["customers", "site_settings"]',  # pick_relevant_tables (now >3 tables with site_settings added)
+            '{"tables": ["customers", "site_settings"]}',  # pick_relevant_tables (now >3 tables with site_settings added)
             BAD_JOIN_SQL,
             GOOD_SQL,
             "Here are the customer names.",  # format_answer

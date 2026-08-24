@@ -1,0 +1,256 @@
+{
+  "db_url": "sqlite:///chinook.db",
+  "cases": [
+    {
+      "id": "total_revenue",
+      "question": "What is the total revenue?",
+      "gold": {
+        "type": "scalar",
+        "value": 2328.6,
+        "tolerance_pct": 0.5
+      },
+      "tags": [
+        "money",
+        "aggregate"
+      ]
+    },
+    {
+      "id": "avg_invoice_total",
+      "question": "What is the average invoice total?",
+      "gold": {
+        "type": "scalar",
+        "value": 5.651941747572815,
+        "tolerance_pct": 0.5
+      },
+      "tags": [
+        "money",
+        "aggregate"
+      ]
+    },
+    {
+      "id": "top5_spenders",
+      "question": "Which 5 customers spent the most?",
+      "gold": {
+        "type": "rows_prefix",
+        "rows": [
+          [
+            "Helena Holý",
+            49.62
+          ],
+          [
+            "Richard Cunningham",
+            47.62
+          ],
+          [
+            "Luis Rojas",
+            46.62
+          ],
+          [
+            "Ladislav Kovács",
+            45.62
+          ],
+          [
+            "Hugh O'Reilly",
+            45.62
+          ]
+        ]
+      },
+      "tags": [
+        "ranking",
+        "money"
+      ]
+    },
+    {
+      "id": "revenue_by_country",
+      "question": "Revenue by country",
+      "gold": {
+        "type": "rows_contains",
+        "rows": [
+          [
+            "USA",
+            523.06
+          ],
+          [
+            "Canada",
+            303.96
+          ],
+          [
+            "France",
+            195.1
+          ]
+        ]
+      },
+      "tags": [
+        "grouping",
+        "money"
+      ]
+    },
+    {
+      "id": "genre_most_revenue",
+      "question": "Which genre generated the most revenue?",
+      "gold": {
+        "type": "scalar_row",
+        "name": "Rock",
+        "value": 826.65,
+        "tolerance_pct": 0.5
+      },
+      "tags": [
+        "multi_hop",
+        "money",
+        "ranking"
+      ]
+    },
+    {
+      "id": "artist_most_tracks",
+      "question": "Which artists sold the most tracks?",
+      "gold": {
+        "type": "scalar_row",
+        "name": "Iron Maiden",
+        "value": 140,
+        "tolerance_pct": 0.5
+      },
+      "tags": [
+        "multi_hop",
+        "count",
+        "grain"
+      ]
+    },
+    {
+      "id": "albums_tracks_top5",
+      "question": "Top 5 albums by number of tracks sold",
+      "gold": {
+        "type": "rows_prefix",
+        "rows": [
+          [
+            "Minha Historia",
+            27
+          ],
+          [
+            "Greatest Hits",
+            26
+          ],
+          [
+            "Unplugged",
+            25
+          ]
+        ]
+      },
+      "tags": [
+        "multi_hop",
+        "count",
+        "ranking",
+        "grain"
+      ]
+    },
+    {
+      "id": "revenue_per_artist",
+      "question": "Total revenue per artist",
+      "gold": {
+        "type": "rows_prefix",
+        "rows": [
+          [
+            "Iron Maiden",
+            138.6
+          ],
+          [
+            "U2",
+            105.93
+          ],
+          [
+            "Metallica",
+            90.09
+          ]
+        ]
+      },
+      "tags": [
+        "multi_hop",
+        "money",
+        "ordering"
+      ]
+    },
+    {
+      "id": "country_most_customers",
+      "question": "Which country has the most customers?",
+      "gold": {
+        "type": "scalar_row",
+        "name": "USA",
+        "value": 13,
+        "tolerance_pct": 0.5
+      },
+      "tags": [
+        "aggregate",
+        "grain"
+      ]
+    },
+    {
+      "id": "num_customers",
+      "question": "How many customers are there?",
+      "gold": {
+        "type": "scalar",
+        "value": 59,
+        "tolerance_pct": 0.0
+      },
+      "tags": [
+        "count"
+      ]
+    },
+    {
+      "id": "spending_list",
+      "question": "List customers and their total spending",
+      "gold": {
+        "type": "rows_contains",
+        "rows": [
+          [
+            "Helena Holý",
+            49.62
+          ],
+          [
+            "Richard Cunningham",
+            47.62
+          ]
+        ]
+      },
+      "tags": [
+        "per_entity",
+        "money"
+      ]
+    },
+    {
+      "id": "num_invoices",
+      "question": "How many invoices are there?",
+      "gold": {
+        "type": "scalar",
+        "value": 412,
+        "tolerance_pct": 0.0
+      },
+      "tags": [
+        "count"
+      ]
+    },
+    {
+      "id": "avg_track_price",
+      "question": "What is the average price of a track?",
+      "gold": {
+        "type": "scalar",
+        "value": 1.05,
+        "tolerance_pct": 1.0
+      },
+      "tags": [
+        "money",
+        "aggregate"
+      ]
+    },
+    {
+      "id": "num_tracks",
+      "question": "How many tracks are in the database?",
+      "gold": {
+        "type": "scalar",
+        "value": 3503,
+        "tolerance_pct": 0.0
+      },
+      "tags": [
+        "count"
+      ]
+    }
+  ]
+}
