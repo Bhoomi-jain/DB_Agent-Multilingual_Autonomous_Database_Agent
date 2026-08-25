@@ -29,6 +29,7 @@ A text-to-SQL model makes *predictable classes* of mistakes. Each observed class
 | **Join fan-out double-counting** (`SUM(Invoice.Total)` ⋈ InvoiceLine ≈ 9× inflation) | `validate_aggregation_fanout` — lineage-based: flags aggregating FROM-root-ancestor columns while a FK-child is joined (detail-side measures are line-grain scaled and immune); auto-repair drops the provably-unneeded child join |
 | **T-SQL `+` string concat** silently becoming numeric addition | `repair_string_concat` — text-typed `+` chains rewritten to `\|\|` |
 | **Metric confusion** ("customers who *spent* most" answered with COUNT or quantity-SUM) | `validate_metric_intent` (lexical + integer-measure guard) + `validate_plan_matches_sql` (structural, vs the LLM's own declared query plan) |
+| **Metric mismatch** ("most expensive X" ranked by total quantity — plan's bogus metric was discarded, leaving nothing to enforce the question's implied measure) | `validate_ranking_target` — infers the implied measure dimension from question vocabulary (price / quantity / money), schema-corroborates it before it can reject, then requires the ORDER BY to target a column of that family; when the question demands a price *extreme* the ORDER BY must aggregate with exactly `MAX()`/`MIN()` — alias-resolved, so `SUM(price) AS total_price` can't hide behind its name — and a plan claiming MAX/MIN is polarity-corroborated by the question and hard-enforced; rejection feeds an actionable retry |
 | Table referenced but never joined | `repair_missing_joins` — inserts the missing JOIN chain |
 | Structurally valid but answers the wrong question ("average X per customer" without GROUP BY) | `validate_grouping_intent` — rejects with an actionable error for the retry loop |
 | Ranking done wrong (no ORDER BY / wrong direction / LIMIT overshoot) | plan-vs-SQL ranking checks — top-N must sort by the planned metric in the planned direction |
@@ -36,6 +37,7 @@ A text-to-SQL model makes *predictable classes* of mistakes. Each observed class
 | Recomputed measures (`SUM(qty × price)`) where a stored total exists | semantic optimizer — learns `Invoice.Total ≡ Σ(qty×price)` via paired probes (persisted to cache), then safely rewrites ungrouped scalar forms; grouped shapes get annotations |
 | Opaque retries | `semantic_diff` — every retry logs structural tags (`AGGREGATE_CHANGE`, `JOIN_DROPPED`, …) into metrics and the report |
 | Arbitrary top-N cutoffs dropping ties | `rewrite_top_n_with_ties` — RANK() rewrite so boundary ties are kept |
+| **Row-attribution errors** (answer names an entity but cites another row's figures; picks one arbitrary "winner" out of tied rows; invents a name outright) | `verify_row_attribution` — entity↔figure same-row binding with accent-tolerant matching, tie arbitrary-pick detection, one corrective retry then a visible banner |
 | Answer text editorializing / fabricating figures | `verify_answer` — every number must trace to real results (comma/rounding-tolerant), one corrective retry |
 
 Before SQL is even generated, Step 2 produces a **structured query plan** (`{tables, metric, metric_column, entity, ranking, grouping}`) from a single merged LLM call — generation is conditioned on it and validation enforces it. Schema context also carries auto-derived **fact/dimension hints** ("Invoice is transactional — totals already aggregated per event") so small models stop fanning out fact tables against their line items.
@@ -124,7 +126,7 @@ The bundled `chinook.db` is the classic [Chinook](https://github.com/lerocha/chi
 
 ## Testing
 
-The suite (21 scripts) runs each test in its own subprocess against real databases — no mocked DB layer — using scripted fake LLMs so tests are deterministic:
+The suite (22 scripts) runs each test in its own subprocess against real databases — no mocked DB layer — using scripted fake LLMs so tests are deterministic:
 
 ```bash
 # One-time: create + seed the fixture databases the suite expects
@@ -181,7 +183,7 @@ Every question is classified on failure (join / grain / aggregation / column-hal
 ├── run_tests.py           # Suite runner: subprocess isolation + report generation
 ├── SETUP_TESTS.md         # Fresh-machine environment setup guide
 ├── PROJECT_HANDOFF.md     # Design decisions, bug-history compendium, roadmap
-├── test_*.py              # 21 self-contained end-to-end tests
+├── test_*.py              # 22 self-contained end-to-end tests
 ├── chinook.db             # Sample DB (gitignored)
 └── pyproject.toml / uv.lock
 ```

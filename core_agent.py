@@ -43,6 +43,7 @@ import asyncio
 import argparse
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -93,20 +94,33 @@ logging.basicConfig(
 
 from collections import Counter as _Counter
 
+import failure_taxonomy
+
+
 class FailureClass:
     SYNTAX_ERROR = "SYNTAX_ERROR"
     JOIN_ERROR = "JOIN_ERROR"
     COLUMN_HALLUCINATION = "COLUMN_HALLUCINATION"
     GRAIN_ERROR = "GRAIN_ERROR"
     AGGREGATION_ERROR = "AGGREGATION_ERROR"
+    METRIC_MISMATCH = "METRIC_MISMATCH"
     MEASURE_SOURCE_ERROR = "MEASURE_SOURCE_ERROR"
     EXECUTION_ERROR = "EXECUTION_ERROR"
     VERIFICATION_ERROR = "VERIFICATION_ERROR"
+    ROW_ATTRIBUTION_ERROR = "ROW_ATTRIBUTION_ERROR"
+    PLAN_TABLE_REJECTION = "PLAN_TABLE_REJECTION"
+    RANKING_ERROR = "RANKING_ERROR"
     NONE = "NONE"
 
 
 def classify_error(message: str, default: str = FailureClass.NONE) -> str:
     m = (message or "")
+    # Validators tag their messages "[slug] ..." (failure_taxonomy.FAILURES);
+    # a recognized tag is authoritative regardless of message wording.
+    slug = failure_taxonomy.slug_of(m)
+    if slug:
+        return getattr(FailureClass,
+                       failure_taxonomy.FAILURES[slug]["failure_class"])
     checks = [
         ("Grain mismatch", FailureClass.GRAIN_ERROR),
         ("does not match any declared foreign-key", FailureClass.JOIN_ERROR),
@@ -118,12 +132,17 @@ def classify_error(message: str, default: str = FailureClass.NONE) -> str:
         ("HOW MANY", FailureClass.AGGREGATION_ERROR),
         ("NO aggregation", FailureClass.AGGREGATION_ERROR),
         ("requires", FailureClass.AGGREGATION_ERROR),
+        ("METRIC MISMATCH", FailureClass.METRIC_MISMATCH),
         ("Only SELECT statements", FailureClass.SYNTAX_ERROR),
         ("Could not parse SQL", FailureClass.SYNTAX_ERROR),
         ("Impossible", FailureClass.EXECUTION_ERROR),
         ("Error executing tool", FailureClass.EXECUTION_ERROR),
         ("could not be fully verified", FailureClass.VERIFICATION_ERROR),
         ("not found in the query results", FailureClass.VERIFICATION_ERROR),
+        ("does not appear anywhere in the result rows",
+         FailureClass.ROW_ATTRIBUTION_ERROR),
+        ("not among the query results", FailureClass.ROW_ATTRIBUTION_ERROR),
+        ("tied rows", FailureClass.ROW_ATTRIBUTION_ERROR),
     ]
     for needle, cls in checks:
         if needle in m:
@@ -133,6 +152,88 @@ def classify_error(message: str, default: str = FailureClass.NONE) -> str:
 
 logger = logging.getLogger("core_agent")
 logger.setLevel(logging.WARNING)  # quiet by default; --verbose turns this up
+
+# ---------------------------------------------------------------------------
+# Format-stage safety net (W-004): large listings never go through the LLM
+# (it collapses into meta-confusion and figure verification passes vacuously
+# when no numbers are cited); small-path answers must at least TOUCH the
+# result data before shipping.
+# ---------------------------------------------------------------------------
+
+FORMAT_PREVIEW_ROW_LIMIT = 50
+FORMAT_PREVIEW_SHOWN = 20
+
+
+def _render_result_preview(result: dict) -> str:
+    """Deterministic listing render — no model in the loop, so no
+    hallucination and nothing to verify vacuously."""
+    cols = [str(c) for c in (result.get("columns") or [])]
+    rows = list(result.get("rows") or [])
+    shown = rows[:FORMAT_PREVIEW_SHOWN]
+
+    def _cell(v):
+        s = str(v)
+        return s if len(s) <= 40 else s[:37] + "..."
+
+    lines = [f"{len(rows)} rows returned."]
+    if cols:
+        lines.append(" | ".join(cols))
+    if shown:
+        lines.append("Showing the first "
+                     f"{len(shown)}:")
+        if cols:
+            lines.append("-" * max(len(" | ".join(cols)), 20))
+        for r in shown:
+            lines.append(" | ".join(_cell(v) for v in r))
+    remaining = len(rows) - len(shown)
+    if remaining > 0:
+        lines.append(f"...and {remaining} more. For a focused answer, add "
+                     f"a filter, a grouping, or a top/bottom-N ranking to "
+                     f"the question.")
+    return "\n".join(lines)
+
+
+def _answer_touches_result(answer: str, result: dict) -> bool:
+    """Cheap detachment detector: does the formatted answer reference ANY
+    column name, any string cell, or any numeric cell value? Pure
+    meta-responses ('There is no question to answer...') fail this even
+    though figure verification can't catch them (zero numbers cited)."""
+    if not answer:
+        return False
+    a_norm = _norm_text(answer)
+    # strip surrounding punctuation per token: "$300." yields "300.", not
+    # "300" (observed: 'The total revenue is $300.' failed to match 300)
+    a_tokens = {t.strip(".,;:!?'\"()[]$%") for t in
+                re.findall(r"[a-z0-9.\-]+", a_norm)}
+    a_tokens.discard("")
+    # numbers cited in the answer, as floats ("$300" -> 300.0) so string-
+    # typed NUMERIC cells ("300.00" via MCP JSON, §6.16) can match them
+    a_nums = {v for v in (_to_number(t) for t in a_tokens) if v is not None}
+
+    def _num_touches(v):
+        return v in a_nums
+
+    for c in result.get("columns") or []:
+        n = _norm_text(str(c))
+        if len(n) >= 3 and n in a_norm:
+            return True
+    for row in result.get("rows") or []:
+        for val in row:
+            if isinstance(val, bool):
+                continue
+            if isinstance(val, str):
+                n = _norm_text(val)
+                if len(n) >= 3 and n in a_norm:
+                    return True
+                v = _to_number(val.strip())
+                if v is not None and _num_touches(v):
+                    return True
+            elif isinstance(val, (int, float)):
+                if str(val) in a_tokens or f"{val:g}" in a_tokens:
+                    return True
+                if _num_touches(float(val)):
+                    return True
+    return False
 
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".schema_cache.json")
 CACHE_TTL_SECONDS = 300
@@ -152,6 +253,7 @@ class Metrics:
     cache_misses: int = 0
     retries: int = 0
     semantic_rejections: int = 0
+    preview_used: bool = False
     answer_verified: bool = True
     verification_retries: int = 0
     step_timings: dict = field(default_factory=dict)
@@ -476,7 +578,17 @@ def unwrap_single(raw):
 # ---------------------------------------------------------------------------
 
 class SemanticValidationError(ValueError):
-    pass
+    """Raised by semantic validators to trigger the bounded retry loop.
+    `category` is a failure_taxonomy slug; the message conventionally
+    carries the same "[slug]" prefix so classify_error and reports can
+    join on it."""
+
+    def __init__(self, message, category=None):
+        super().__init__(message)
+        # Explicit category wins; otherwise derive from a "[slug]" tag in the
+        # message so raise sites only need to format the message correctly.
+        self.category = (category or failure_taxonomy.slug_of(message)
+                         or failure_taxonomy.DEFAULT_SLUG)
 
 
 def _resolve_table_aliases(ast: exp.Expression) -> dict:
@@ -545,6 +657,113 @@ def validate_join_semantics(sql: str, foreign_keys: list, dialect: str = "") -> 
                     f"FK: lines in the schema for the real relationship, and "
                     f"whether an intermediate table is needed to connect them."
                 )
+
+
+def validate_join_connectivity(sql: str, foreign_keys: list,
+                               dialect: str = "") -> None:
+    """Connected-components check over the outer query's join graph
+    (W-006): every ON-condition can be a genuine FK pair and the query can
+    STILL be a cross-product — if the tables form two or more disconnected
+    components, some component's rows multiply against the others'. This
+    caught 'Artist⋈Album' floating free of 'InvoiceLine⋈Invoice⋈Track',
+    inflating revenue ~353x while every individual predicate looked valid.
+
+    Nodes: real tables in the outermost FROM/JOINs (derived-table internals
+    belong to their own scope and are ignored). Edges: column=column
+    predicates (ON or WHERE) that resolve to declared FK relationships in
+    either direction. >1 component -> actionable rejection naming candidate
+    FK edges that would reconnect them."""
+    try:
+        ast = sqlglot.parse_one(sql, read=dialect or None)
+    except Exception:
+        return
+    if not isinstance(ast, exp.Select):
+        return
+    frm = ast.args.get("from_") or ast.args.get("from")
+    if frm is None:
+        return
+
+    def _table_name(node):
+        return node.this.name if isinstance(node, exp.Table) else None
+
+    nodes = []
+    top = _table_name(frm.this)
+    if top:
+        nodes.append(top)
+    for join in ast.args.get("joins", []):
+        n = _table_name(join.this)
+        if n:
+            nodes.append(n)
+    # Derived tables in the outer scope are opaque row-sources: exclude
+    # their INNER tables from this scope's graph entirely.
+    if not nodes:
+        return
+
+    aliases = _resolve_table_aliases(ast)
+    fk_pairs = _fk_pairs(foreign_keys)
+
+    parent = {n: n for n in nodes}
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    def _edge_from_eqs(expr):
+        if expr is None:
+            return
+        for eq in expr.find_all(exp.EQ):
+            l, r = eq.this, eq.expression
+            if not (isinstance(l, exp.Column) and isinstance(r, exp.Column)):
+                continue
+            lt = aliases.get(l.table, l.table)
+            rt = aliases.get(r.table, r.table)
+            if lt in parent and rt in parent and lt != rt:
+                if (lt, l.name, rt, r.name) in fk_pairs or \
+                        (rt, r.name, lt, l.name) in fk_pairs:
+                    _union(lt, rt)
+
+    for join in ast.args.get("joins", []):
+        _edge_from_eqs(join.args.get("on"))
+    _edge_from_eqs(ast.args.get("where"))
+
+    components = {}
+    for n in nodes:
+        components.setdefault(_find(n), []).append(n)
+    if len(components) <= 1:
+        return
+
+    comp_of = {t: root for root, ts in components.items() for t in ts}
+    hints = []
+    seen = set()
+    for fk in foreign_keys:
+        a, b = fk["table"], fk["references_table"]
+        if a in comp_of and b in comp_of and \
+                comp_of[a] != comp_of[b] and (a, b) not in seen:
+            seen.add((a, b))
+            seen.add((b, a))
+            cols = ", ".join(
+                f"{a}.{c} = {b}.{rc}"
+                for c, rc in zip(fk["columns"], fk["references_columns"]))
+            hints.append(cols)
+
+    parts = "; ".join(", ".join(sorted(ts)) for ts in components.values())
+    hint = (" Candidate edges that would connect the components: "
+            + " | ".join(hints)) if hints else ""
+    raise SemanticValidationError(
+        f"[missing_join] The query touches {len(nodes)} tables that form "
+        f"{len(components)} DISCONNECTED groups ({parts}) — every group's "
+        f"rows cross-multiply against the others, so aggregates would be "
+        f"silently inflated. Join each group to the rest through declared "
+        f"foreign-key paths.{hint}",
+        category="missing_join",
+    )
 
 
 def _fk_graph_and_edges(foreign_keys: list):
@@ -1027,14 +1246,17 @@ def _fanout_findings(ast: exp.Expression, foreign_keys: list,
     ({'x': aggregated table, 'multiplying': set of joined FK-children,
     'agg': the aggregate node}). Empty list = clean.
 
-    Lineage-based rule (v2, after a live false positive taught the
-    difference): starting from the FROM-root table B, walk UPWARD through
-    declared FKs — those tables form B's lookup lineage. Aggregating any
-    lineage column is inflated iff a FK-CHILD of it is also joined (the
-    result then carries one row per child). Aggregating columns from BELOW
-    the root (descendant/detail tables) is inherently line-grain scaled —
-    SUM(line.qty * line.price) is exact revenue, never flagged, no matter
-    that the detail table's lookup parents appear in the joins."""
+    Lineage-based rule (v3, after W-008 taught that v2's immunity was
+    drawn along expression-SYNTAX lines and a parent×child arithmetic mix
+    walked straight through it): starting from the FROM-root table B, walk
+    UPWARD through declared FKs — those tables form B's lookup lineage.
+    Aggregating any lineage column is inflated iff a FK-CHILD of it is
+    also joined (the result then carries one row per child). Aggregating
+    columns from BELOW the root (descendant/detail tables) is inherently
+    line-grain scaled — SUM(line.qty * line.price) is exact revenue, never
+    flagged, no matter that the detail table's lookup parents appear in
+    the joins — but ONLY while every operand stays detail-side; one
+    ancestor operand makes the whole aggregate suspect."""
     if not isinstance(ast, exp.Select):
         return []
 
@@ -1083,26 +1305,356 @@ def _fanout_findings(ast: exp.Expression, foreign_keys: list,
                           for c in agg.this.find_all(exp.Column)}
         arg_tables.discard(None)
 
-        # Pure detail-side measures scale with the line grain themselves —
-        # structurally immune to fan-out.
-        if arg_tables and arg_tables & below_root:
-            continue
+        # Detail-side measures scale with the line grain themselves —
+        # structurally immune to fan-out. Immunity is PER-COLUMN-LINEAGE
+        # (W-008): an expression that mixes detail columns with LINEAGE
+        # (root/ancestor) columns — SUM(Total * Quantity), the §6.20
+        # founding failure returning through the syntax-shaped immunity
+        # seam — does NOT scale with the line grain, so any lineage
+        # operand disqualifies the blanket exemption.
+        if arg_tables and arg_tables & below_root \
+                and not arg_tables & lineage:
+            continue  # pure detail-side arithmetic: exact, immune
         candidates = ([base] if base else []) if not arg_tables \
             else sorted(t for t in arg_tables if t in lineage)
         if not candidates:
             continue  # nothing anchored to the duplicating lineage
-        if not below_root:
-            continue  # no detail table joined below: no duplication exists
+        # NOTE: no "nothing joined below root" early-out here — W-008's
+        # minimal shape (SUM(Parent.Total * Child.qty) with the parent
+        # joined through its OWN child base) duplicates without any third
+        # table; the per-candidate `multiplying` check below is the exact
+        # inflation condition, and _grouped_at_grain guards the rest.
 
+        all_cols = list(agg.this.find_all(exp.Column))
+        lineage_cols = [c for c in all_cols
+                        if aliases.get(c.table, c.table) in lineage]
+        has_stored_measure = any(
+            _is_stored_measure_name(c.name) for c in lineage_cols)
         for x in candidates:
             multiplying = query_tables & children_of.get(x, set())
             if not multiplying:
+                continue
+            # Product-spanning exemption: when the aggregate itself
+            # references the duplicating child's grain (SUM(qty * price)
+            # across the very join that multiplies), each source row is
+            # counted exactly once — line-grain exact, never inflate.
+            # Exception: a STORED-MEASURE lineage operand (Total * qty)
+            # still counts its parent value once per surviving row.
+            if (arg_tables & (below_root | multiplying)
+                    and not has_stored_measure):
                 continue
             if any(_grouped_at_grain(t) for t in ({x} | multiplying)):
                 continue
             findings.append({"x": x, "multiplying": multiplying, "agg": agg})
             break
     return findings
+
+
+def repair_join_connectivity(sql: str, foreign_keys: list,
+                             dialect: str = "") -> str:
+    """Deterministic half of fix #3: when validate_join_connectivity finds
+    two components and exactly one declared-FK edge reconnects a pair of
+    ALREADY-JOINED tables, AND-append that equality to the matching JOIN
+    node's ON clause (live llama3.2 could not act on the hint unaided).
+    Anything ambiguous returns the SQL untouched."""
+    try:
+        ast = sqlglot.parse_one(sql, read=dialect or None)
+    except Exception:
+        return sql
+    if not isinstance(ast, exp.Select):
+        return sql
+
+    aliases = _resolve_table_aliases(ast)
+    fk_pairs = _fk_pairs(foreign_keys)
+
+    def _edge_from(on):
+        pairs = set()
+        if on is None:
+            return pairs
+        for eq in on.find_all(exp.EQ):
+            l, r = eq.this, eq.expression
+            if isinstance(l, exp.Column) and isinstance(r, exp.Column):
+                lt = aliases.get(l.table, l.table)
+                rt = aliases.get(r.table, r.table)
+                if lt and rt and (lt, l.name, rt, r.name) in fk_pairs:
+                    pairs.add((lt, rt))
+        return pairs
+
+    edges = set()
+    joins = list(ast.args.get("joins", []))
+    for j in joins:
+        edges |= _edge_from(j.args.get("on"))
+    edges |= _edge_from(ast.args.get("where"))
+
+    # union-find over resolved table names
+    parent = {}
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a, b): parent[find(a)] = find(b)
+    for t in aliases.values():
+        find(t)
+    for a, b in edges:
+        union(a, b)
+
+    # candidate reconnecting FKs
+    candidates = []
+    seen = set()
+    for fk in foreign_keys:
+        a, b = fk["table"], fk["references_table"]
+        if a in parent and b in parent and find(a) != find(b) \
+                and (a, b) not in seen:
+            seen.add((a, b)); seen.add((b, a))
+            candidates.append(fk)
+    if not candidates:
+        return sql
+
+    changed = False
+    for fk in candidates:
+        child, parent_t = fk["table"], fk["references_table"]
+        col_pairs = list(zip(fk["columns"], fk["references_columns"]))
+        # find the JOIN node introducing either endpoint
+        target = None
+        target_side = None
+        for j in ast.args.get("joins", []):
+            tnode = j.this if isinstance(j.this, exp.Table) else None
+            if tnode is None:
+                continue
+            tname = tnode.name
+            if tname == child:
+                target, target_side = j, "child"
+                break
+            if tname == parent_t:
+                target, target_side = j, "parent"
+                break
+        if target is None:
+            continue
+        # build equality using the ALIASES actually present in the query
+        alias_of = {v: k for k, v in aliases.items()}
+        ca_ = alias_of.get(child, child)
+        pa_ = alias_of.get(parent_t, parent_t)
+        conds = []
+        for cc, pc in col_pairs:
+            conds.append(exp.EQ(
+                this=exp.Column(table=ca_, name=cc),
+                expression=exp.Column(table=pa_, name=pc)))
+        new_on = target.args.get("on")
+        for cond in conds:
+            new_on = cond if new_on is None else exp.and_(new_on, cond)
+        target.set("on", new_on)
+        union(child, parent_t)
+        changed = True
+
+    return sqlglot.parse_one(ast.sql(dialect=dialect or None),
+                             read=dialect or None).sql(dialect=dialect or None) \
+        if changed else sql
+
+
+def validate_measure_expression(sql: str, table_schemas: dict,
+                                foreign_keys: list,
+                                dialect: str = "") -> None:
+    """Double-aggregation guard (Fix #10, W-008) — an INDEPENDENT net from
+    the fan-out lineage detector: grounded in measure SEMANTICS rather
+    than join topology. When one aggregate expression combines columns
+    from two tables in a direct FK child<->parent relationship AND the
+    parent-side column is a numeric non-PK (a stored, pre-aggregated
+    measure like Invoice.Total), every parent value is about to be counted
+    once per surviving child row — SUM(Total * Quantity) counts each
+    invoice's total once per line item TIMES the quantity. Rejection names
+    both correct forms so the retry has somewhere to go."""
+    try:
+        ast = sqlglot.parse_one(sql, read=dialect or None)
+    except Exception:
+        return
+    if not isinstance(ast, exp.Select):
+        return
+
+    aliases = _resolve_table_aliases(ast)
+    parents_of: dict = {}
+    for fk in foreign_keys:
+        parents_of.setdefault(fk["table"], set()).add(fk["references_table"])
+
+    for agg in ast.find_all(exp.Sum, exp.Avg):
+        if agg.args.get("distinct") is not None \
+                or isinstance(agg.this, exp.Star):
+            continue
+        infos = [(aliases.get(c.table, c.table), c.name)
+                 for c in agg.this.find_all(exp.Column)]
+        infos = [(t, n) for t, n in infos if t]
+        for i in range(len(infos)):
+            for j in range(i + 1, len(infos)):
+                (ta, na), (tb, nb) = infos[i], infos[j]
+                if ta == tb:
+                    continue
+                if tb in parents_of.get(ta, ()):
+                    child_t, parent_t, child_col, parent_col = ta, tb, na, nb
+                elif ta in parents_of.get(tb, ()):
+                    child_t, parent_t, child_col, parent_col = tb, ta, nb, na
+                else:
+                    continue
+                ptype = _column_type(table_schemas, parent_t, parent_col)
+                numeric = str(ptype or "").upper().startswith(
+                    ("NUMERIC", "DECIMAL", "DEC", "REAL", "FLOA", "DOUBLE",
+                     "MONEY", "INT"))
+                is_pk = any(c.get("primary_key") for c in
+                            table_schemas.get(parent_t, [])
+                            if c.get("name") == parent_col)
+                # Stored-MEASURE test, not just numeric: Track.UnitPrice is
+                # a raw per-row ATTRIBUTE living on a lookup parent —
+                # multiplying it by line quantities is exactly how line
+                # revenue is computed (live false positive). Only columns
+                # NAMED like pre-aggregated totals count here.
+                stored_measure = _is_stored_measure_name(parent_col)
+                if numeric and not is_pk and stored_measure:
+                    raise SemanticValidationError(
+                        f"[semantic_error] '{parent_t}.{parent_col}' is a "
+                        f"stored total on the PARENT table "
+                        f"— multiplying it by {child_t}-grain values inside "
+                        f"{type(agg).__name__.upper()}() double-counts it "
+                        f"(one parent value per surviving child row). For "
+                        f"{child_t}-level revenue use "
+                        f"SUM({child_t}-columns); for {parent_t}-level "
+                        f"totals use {type(agg).__name__.upper()}("
+                        f"{parent_t}.{parent_col}) without the {child_t} "
+                        f"join.", category="semantic_error",
+                    )
+
+
+_N_VOCAB_RE = re.compile(
+    r"\b(?:top|bottom|first|last|newest|oldest|latest|next|previous)\s*"
+    r"[- ]?\s*\d*|\b\d+\s*(?:rows?|items?|results?|entries?|records?)\b",
+    re.IGNORECASE,
+)
+_SUPERLATIVE_RE = re.compile(
+    r"\b(?:most|least|best|worst|highest|lowest|biggest|smallest|longest|"
+    r"shortest|largest|fewest|maximum|minimum|cheapest|cheaper|priciest|"
+    r"costliest|expensive)\b",
+    re.IGNORECASE,
+)
+
+
+def validate_aggregation_grain(sql: str, question: str,
+                               plan: Optional[dict], table_schemas: dict,
+                               foreign_keys: list,
+                               dialect: str = "") -> None:
+    """Dimension-grain anchor (Fix #8, W-002): when a scalar-aggregate
+    question names ONE entity table and the aggregated column exists on
+    that entity, the aggregate must be computed FROM that entity's rows.
+    AVG over a joined detail table is sales-frequency-weighted — a
+    different statistic that the fan-out detector structurally cannot see
+    (AVG never inflates, it just biases toward popular rows).
+
+    Guards against false positives: the entity claim must be lexically
+    corroborated by the question; grouped shapes, non-scalar questions,
+    absent plans, and aggregates whose columns don't exist on the claimed
+    entity all pass untouched."""
+    if not plan:
+        return
+    entity = plan.get("entity")
+    tokens = set(re.findall(r"[a-z0-9]+", (question or "").lower()))
+    if not entity or entity not in table_schemas:
+        # lexical entity inference (planner noise is exactly why we are
+        # here): unique schema table whose lexemes the question names
+        cands = [t for t in table_schemas
+                 if tokens & _table_lexemes(t)]
+        if len(cands) != 1:
+            return
+        entity = cands[0]
+    if infer_result_shape(question) != "scalar":
+        return
+    # corroboration: the question must actually reference this table's
+    # domain ('average TRACK price' -> entity=Track is real, not noise)
+    if not (tokens & _table_lexemes(entity)):
+        return
+
+    try:
+        ast = sqlglot.parse_one(sql, read=dialect or None)
+    except Exception:
+        return
+    if not isinstance(ast, exp.Select):
+        return
+    if ast.args.get("group") is not None:
+        return  # per-X breakdowns are a different shape entirely
+    aggs = [a for a in ast.find_all(*_AGG_TYPES)
+            if not isinstance(a, (exp.Min, exp.Max))]
+    if not aggs:
+        return  # MIN/MAX are duplication-idempotent; nothing to anchor
+
+    frm = ast.args.get("from_") or ast.args.get("from")
+    base = None
+    if frm is not None:
+        first = next(iter(frm.find_all(exp.Table)), None)
+        base = first.name if first else None
+    if base is None or base == entity:
+        return  # already computing over the planned entity
+
+    aliases = _resolve_table_aliases(ast)
+    # does ANY aggregated operand column exist on the claimed entity?
+    for agg in aggs:
+        for col in agg.this.find_all(exp.Column):
+            t = aliases.get(col.table, col.table)
+            if t == entity or _column_type(table_schemas, entity,
+                                           col.name):
+                raise SemanticValidationError(
+                    f"[wrong_grain] '{col.name}' belongs to {entity}, but "
+                    f"this aggregate computes over {base} rows — joined "
+                    f"{base} rows weight the result by frequency instead "
+                    f"of answering the per-{entity} question. Aggregate "
+                    f"directly over {entity} without joining transactional "
+                    f"tables.",
+                    category="wrong_grain",
+                )
+
+
+def validate_unsolicited_limit(sql: str, question: str, plan: Optional[dict],
+                               table_schemas: dict, foreign_keys: list,
+                               dialect: str = "") -> None:
+    """W-003#1: a plain listing question silently became 'top 20 by total'
+    because the generator added LIMIT 20 while the plan carried NO ranking,
+    and every existing ranking check only fires WHEN the plan ranks. This
+    closes the inverse direction: an uncorroborated LIMIT on a listing is
+    scope drift and gets rejected (retry message tells the model to drop it
+    or the user to phrase a top-N).
+
+    Deliberate exemptions (fail-open): plan-enabled ranking; any top/bottom/
+    first/N vocabulary; ANY superlative ('most', 'highest', ...) which may
+    legitimately end in LIMIT 1 even when the plan missed the ranking claim;
+    and ungrouped scalar aggregates where LIMIT 1 changes nothing."""
+    try:
+        ast = sqlglot.parse_one(sql, read=dialect or None)
+    except Exception:
+        return
+    if not isinstance(ast, exp.Select):
+        return
+    if ast.args.get("limit") is None:
+        return
+
+    ranking = (plan or {}).get("ranking")
+    if isinstance(ranking, dict) and ranking.get("enabled"):
+        return  # planned ranking: existing direction/LIMIT checks govern
+
+    if _N_VOCAB_RE.search(question or ""):
+        return
+    if _SUPERLATIVE_RE.search(question or ""):
+        return
+
+    # ungrouped whole-table aggregate -> one row regardless of LIMIT
+    if not ast.args.get("group") and not ast.args.get("having") \
+            and any(ast.find_all(*_AGG_TYPES)) \
+            and not [e for e in ast.expressions if not isinstance(e, exp.AggFunc)]:
+        return
+
+    raise SemanticValidationError(
+        "[scope_drift] The question asks for a full listing but the SQL "
+        f"adds {ast.args.get('limit').expression.this if ast.args.get('limit') else 'a'} "
+        "LIMIT — that silently drops rows and can masquerade as a top-N "
+        "the user never requested. Remove the LIMIT, or keep it ONLY if "
+        "you also state the cutoff explicitly in the answer.",
+        category="scope_drift",
+    )
 
 
 def repair_fanout_join(sql: str, foreign_keys: list,
@@ -1394,6 +1946,229 @@ def validate_metric_intent(question: str, sql: str, dialect: str = "",
 
 
 # ---------------------------------------------------------------------------
+# Fallback metric inference + ranking-target validation. This closes the gap
+# left by the plan corroboration gate: when the Step-2 plan claims a metric
+# the question doesn't lexically support, the metric is DISCARDED — which is
+# correct (obeying it rejected good listing SQL once) but left validation
+# with NOTHING to enforce, so a ranked question could be answered by SQL
+# aggregating an arbitrary unrelated measure (observed live: "Which customer
+# bought the most expensive track?" answered by customers ranked by
+# SUM(Quantity) — structurally perfect, fully verified, entirely the wrong
+# metric). Inference here is deliberately WEAK-signal: it can only VETO an
+# obviously-unrelated ranking target, never force a specific rewrite.
+# ---------------------------------------------------------------------------
+
+_PRICE_WORD_RE = re.compile(
+    r"\b(?:expensive|cheapest|cheaper|cheap|priciest|costliest|pricey)\b",
+    re.IGNORECASE,
+)
+_QUANTITY_WORD_RE = re.compile(
+    r"\b(?:bought|purchased|ordered|popular|played|listened|streamed|rented|sold)\b",
+    re.IGNORECASE,
+)
+
+# Price-superlative POLARITY: which END of the price range the question
+# wants. This is the vocabulary the plan corroboration gate was missing —
+# "most expensive" carries a clear MAX claim even though it matches neither
+# _MONEY_TERM_RE nor _COUNT_INTENT_RE, which is exactly why llama3.2's
+# metric=MAX got discarded and nothing enforced it (§6.26).
+_PRICE_SUPERLATIVE_MAX_RE = re.compile(
+    r"\b(?:most\s+(?:expensive|pricey|costly)|highest\s+(?:price|cost)"
+    r"|priciest|costliest|top[- ]priced)\b",
+    re.IGNORECASE,
+)
+_PRICE_SUPERLATIVE_MIN_RE = re.compile(
+    r"\b(?:least\s+(?:expensive|pricey|costly)|cheapest"
+    r"|lowest\s+(?:price|cost))\b",
+    re.IGNORECASE,
+)
+
+
+def agg_polarity_for_question(question: str) -> Optional[str]:
+    """'MAX' / 'MIN' when the question lexically demands a point-extreme
+    over price, else None. Used BOTH to corroborate the plan's claimed
+    metric (so it survives the gate) and as the fallback expectation when
+    the plan is absent or silent."""
+    if _PRICE_SUPERLATIVE_MAX_RE.search(question):
+        return "MAX"
+    if _PRICE_SUPERLATIVE_MIN_RE.search(question):
+        return "MIN"
+    return None
+
+# Family vocabularies are matched against SEGMENTS of a column name, not
+# substrings — substring matching would make "TotalQuantity" pass a money
+# check via its "total" prefix and repeat the §6.25 class of bug where
+# "order_lines" fragment-matched "orders". Segments handle snake_case and
+# camelCase alike: "UnitPrice" -> [unit, price], "TotalQuantity" ->
+# [total, quantity].
+_PRICE_SEGMENTS = {"price", "cost", "costs", "fee", "rate"}
+_MONEY_SEGMENTS = {"revenue", "spend", "spent", "earning", "earnings",
+                   "income", "turnover", "amount", "total", "billed",
+                   "sales", "value", "price", "cost"}
+_QUANTITY_SEGMENTS = {"quantity", "qty", "count", "counts", "units", "number"}
+
+_NAME_SEGMENT_RE = re.compile(r"[A-Za-z][a-z]*|\d+")
+
+
+def _column_segments(name: str) -> set:
+    """Split a column name into lowercase word segments: 'UnitPrice' ->
+    {'unit', 'price'}, 'unit_price' -> {'unit', 'price'}."""
+    return {s.lower() for s in _NAME_SEGMENT_RE.findall(name or "")}
+
+
+def infer_measure_dimension(question: str) -> Optional[dict]:
+    """Lexically infer WHAT the question ranks/aggregates over, as a
+    fallback for when the plan supplies no trusted metric. Returns
+    {'dimension', 'segments', 'allow_count_any', 'agg'} or None when
+    nothing recognizable is present (fail open). 'agg' carries the exact
+    aggregate family when the question demands one (MAX/MIN for price
+    superlatives); None = family-level only. Priority: price > quantity >
+    money — a superlative over expensiveness is about unit prices even
+    when other vocabulary also appears."""
+    if _PRICE_WORD_RE.search(question):
+        return {"dimension": "price", "segments": _PRICE_SEGMENTS,
+                "allow_count_any": False,
+                "agg": agg_polarity_for_question(question)}
+    if _QUANTITY_WORD_RE.search(question):
+        return {"dimension": "quantity", "segments": _QUANTITY_SEGMENTS,
+                # "which X did customers buy most" is legitimately COUNT(*)
+                "allow_count_any": True, "agg": None}
+    if _MONEY_TERM_RE.search(question):
+        return {"dimension": "money", "segments": _MONEY_SEGMENTS,
+                "allow_count_any": False, "agg": None}
+    return None
+
+
+def validate_ranking_target(question: str, sql: str, dialect: str = "",
+                            table_schemas: Optional[dict] = None,
+                            plan: Optional[dict] = None) -> None:
+    """When the question implies WHAT should be ranked (price/quantity/
+    money), the query's top-level ORDER BY must actually target a column
+    from that family. Schema-corroborated before it can reject: the family
+    must exist among the fetched schemas, otherwise this stays silent —
+    the same anti-false-positive rule that §6.24(a) taught (word-only
+    signals killed correct attempts three retries in a row).
+
+    When the question demands an exact extreme ("most expensive"/"cheapest"),
+    ranking by ANY aggregate other than that extreme over a price-family
+    column is rejected too: SUM(price) per group measures volume-of-money,
+    not the single most expensive item.
+
+    Fires only on an explicit top-level ORDER BY. Queries without one are
+    not checked: rewrite_top_n_with_ties never invents an ordering either,
+    so there is no hidden effective sort to reason about."""
+    dim = infer_measure_dimension(question)
+    if not dim:
+        return
+    if not (_RANK_HINT_RE.search(question)
+            or (plan or {}).get("ranking", {}).get("enabled")):
+        return
+
+    try:
+        ast = sqlglot.parse_one(sql, read=dialect or None)
+    except Exception:
+        return
+    if not isinstance(ast, exp.Select):
+        return
+    order_node = ast.args.get("order")
+    if order_node is None:
+        return  # no explicit ranking to validate — fail open
+
+    aliases = _resolve_table_aliases(ast)
+
+    def _family_hit(col_name: str) -> bool:
+        return bool(_column_segments(col_name) & dim["segments"])
+
+    ordered_keys = []
+    for ordered in order_node.expressions:
+        cols = [c for c in ordered.find_all(exp.Column)]
+        if not cols:
+            continue  # e.g. ORDER BY 1 / constant — nothing to judge here
+        for c in cols:
+            t = aliases.get(c.table, c.table) if c.table else None
+            ordered_keys.append((t, c.name))
+
+    if not ordered_keys:
+        return
+
+    # Aggregate-SHAPE enforcement (the consumer dim["agg"] was missing):
+    # a price superlative demands the exact extreme — MAX/MIN — not just
+    # any ranking over a price-family column. Observed live shape this
+    # catches: SUM(oi.unit_price) AS total_price ranked per customer for
+    # "most expensive" — the alias family-hits, so only the aggregate
+    # itself betrays the drift. ORDER BY expressions are resolved through
+    # one level of select-list aliasing first, or "ORDER BY total_price"
+    # hides the SUM behind an innocent name.
+    want_agg = dim.get("agg")
+    proj_aliases = {
+        e.alias.lower(): e.this
+        for e in ast.expressions
+        if isinstance(e, exp.Alias)
+    }
+    ordered_exprs = []
+    for ordered in order_node.expressions:
+        expr = ordered.this
+        if isinstance(expr, exp.Column):
+            expr = proj_aliases.get(expr.name.lower(), expr)
+        ordered_exprs.append(expr)
+    ordered_aggs = {type(a).__name__.upper()
+                    for o in ordered_exprs for a in o.find_all(*_AGG_TYPES)}
+    agg_mismatch = bool(want_agg) and bool(ordered_aggs) \
+        and want_agg not in ordered_aggs
+
+    # A COUNT aggregate in the ordered expression measures volume outright;
+    # legitimate for quantity questions regardless of the column it runs on.
+    count_ranking = (
+        dim["allow_count_any"]
+        and any(isinstance(a, exp.Count)
+                for o in order_node.expressions
+                for a in o.find_all(*_AGG_TYPES))
+    )
+
+    if (any(_family_hit(name) for _, name in ordered_keys)
+            or count_ranking) and not agg_mismatch:
+        return
+
+    # Schema corroboration BEFORE rejecting: some column of this family
+    # must actually exist among the fetched schemas, else our lexical
+    # inference is untrustworthy noise (§6.24a rule).
+    if not table_schemas:
+        return
+    candidates = sorted({
+        f"{t}.{c['name']}"
+        for t, cols in table_schemas.items()
+        for c in cols
+        if _family_hit(c["name"])
+    })
+    if not candidates:
+        logger.info(
+            f"[ranking-target] question implies {dim['dimension']} but no "
+            f"{dim['dimension']}-family column exists in the fetched "
+            f"schemas - failing open")
+        return
+
+    cited = ", ".join(f"'{name}'" for _, name in ordered_keys[:3])
+    if agg_mismatch:
+        raise SemanticValidationError(
+            f"METRIC MISMATCH: the question asks for a single price "
+            f"extreme (\"most expensive\"/\"cheapest\" language), which "
+            f"means {want_agg}() over the price — but the query ranks by "
+            f"{'/'.join(sorted(ordered_aggs))}() instead, and totaling or "
+            f"averaging prices answers a different question than locating "
+            f"the extreme one. Rank directly by {want_agg}() over a price "
+            f"column such as: {candidates[:5]} — or keep the row grain and "
+            f"filter with price = (SELECT {want_agg}(price) FROM <table>)."
+        )
+    raise SemanticValidationError(
+        f"METRIC MISMATCH: the question ranks by {dim['dimension']} "
+        f"(\"{dim['dimension']}\" language detected), but the query orders "
+        f"by {cited}, which does not measure {dim['dimension']}. Rank by a "
+        f"{dim['dimension']}-style column instead, such as: "
+        f"{candidates[:5]}."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Plan-vs-SQL consistency — Phase-2 upgrade over the lexical intent check.
 # Step 2's LLM call now also emits a structured QUERY PLAN (metric / entity /
 # ranking / grouping). When a plan exists, the generated SQL must implement
@@ -1406,12 +2181,41 @@ def validate_metric_intent(question: str, sql: str, dialect: str = "",
 # Total, top-5 DESC" — the SQL must comply or take a targeted retry.
 # ---------------------------------------------------------------------------
 
+_STORED_MEASURE_NAMES = {"total", "subtotal", "sub_total", "grand_total",
+                         "amount_total", "invoice_total"}
+
+
+def _is_stored_measure_name(col: str) -> bool:
+    return (col or "").lower() in _STORED_MEASURE_NAMES
+
+
+_LIST_INTENT_RE = re.compile(
+    r"\b(?:list|enumerate|show(?:\s+all|\s+me)?|name\s+(?:all|the|each)"
+    r"|which|what\s+are)\b",
+    re.IGNORECASE,
+)
+_AGG_DEMAND_RE = re.compile(
+    r"\b(?:how\s+(?:many|much)|number\s+of|total|average|avg|sum(?:med)?"
+    r"|max(?:imum)?|min(?:imum)?|most|least|best|worst|highest|lowest)\b",
+    re.IGNORECASE,
+)
+
+
+def infer_result_shape(question: Optional[str]) -> Optional[str]:
+    """Lexical fallback for the plan's result_shape (Fix #7): listing
+    vocabulary with NO aggregation demand implies entity rows are wanted;
+    aggregation demand implies a scalar. Ambiguous -> None (fail open)."""
+    q = question or ""
+    if _LIST_INTENT_RE.search(q) and not _AGG_DEMAND_RE.search(q):
+        return "list"
+    if _AGG_DEMAND_RE.search(q):
+        return "scalar"
+    return None
+
+
 def validate_plan_matches_sql(plan: Optional[dict], sql: str, dialect: str = "",
                               table_schemas: Optional[dict] = None,
                               question: Optional[str] = None) -> None:
-    if not plan:
-        return
-
     try:
         ast = sqlglot.parse_one(sql, read=dialect or None)
     except Exception:
@@ -1419,6 +2223,27 @@ def validate_plan_matches_sql(plan: Optional[dict], sql: str, dialect: str = "",
     if not isinstance(ast, exp.Select):
         return
 
+    # Fix #7 — intent_error: a listing question must never be answered by
+    # a bare global aggregate (W-001/W-005). Question-driven, so it fires
+    # even when the Step-2 plan is empty or None; aggregation-demand
+    # vocabulary ("how many", "most", "total", ...) flips the expectation
+    # to scalar and keeps every count/average/extreme question exempt.
+    if infer_result_shape(question) == "list":
+        has_group = ast.args.get("group") is not None
+        aggs = list(ast.find_all(*_AGG_TYPES))
+        non_agg_select = [e for e in ast.expressions
+                          if not isinstance(e, _AGG_TYPES)]
+        if aggs and not has_group and not non_agg_select:
+            raise SemanticValidationError(
+                "[intent_error] The question asks to LIST entities, but "
+                "this query returns ONE aggregated number with no GROUP BY "
+                "— that answers 'how many', not 'which/list'. Select the "
+                "entity rows themselves.",
+                category="intent_error",
+            )
+
+    if not plan:
+        return
     families = {type(a).__name__.upper() for a in ast.find_all(*_AGG_TYPES)}
     metric = plan.get("metric")
 
@@ -1603,12 +2428,54 @@ def validate_plan_matches_sql(plan: Optional[dict], sql: str, dialect: str = "",
     if entity:
         tables_in_sql = {t.name for t in ast.find_all(exp.Table)}
         if tables_in_sql and entity not in tables_in_sql:
-            raise SemanticValidationError(
-                f"The query plan identifies '{entity}' as the main table the "
-                f"question is about, but it never appears in FROM/JOIN "
-                f"(query touches: {sorted(tables_in_sql)}). Query the planned "
-                f"table."
-            )
+            if _main_table_claim_corroborated(entity, question):
+                raise SemanticValidationError(
+                    f"[overvalidation] The query plan identifies '{entity}' "
+                    f"as the main table the question is about, but it never "
+                    f"appears in FROM/JOIN (query touches: "
+                    f"{sorted(tables_in_sql)}). Query the planned table.",
+                    category="overvalidation",
+                )
+            # Uncorroborated claim: nothing in the question ties it to this
+            # table, and enforcing killed three correct attempts live
+            # (W-007 — "Which genre generated the most revenue?" planned as
+            # Invoice). Same doctrine as §6.24a for metric claims: planner
+            # noise may only be enforced when the question corroborates it.
+            logger.info(
+                f"[plan] ignoring uncorroborated main-table claim "
+                f"'{entity}' (not in SQL, not named by the question)")
+
+
+def _table_lexemes(table_name: str) -> set:
+    """Singular/plural lexemes of a table name, '_' split: 'InvoiceLine' ->
+    {'invoiceline', 'invoicelines'}; 'order_lines' -> {'order', 'orders',
+    'line', 'lines'}."""
+    out = set()
+    for word in re.split(r"[\s_]+", table_name or ""):
+        lw = word.lower()
+        if not lw:
+            continue
+        out.add(lw)
+        out.add(lw + "s")
+        if lw.endswith("s"):
+            out.add(lw[:-1])
+        if lw.endswith("es"):
+            out.add(lw[:-2])
+    return out
+
+
+def _main_table_claim_corroborated(entity: str,
+                                   question: Optional[str]) -> bool:
+    """True when the main-table claim may be ENFORCED. A question that
+    references the claimed table corroborates it ('How many INVOICES were
+    issued…' ↔ entity=Invoice). With NO question text there is nothing to
+    contradict the plan, so the historical strict contract stands. The
+    W-007 case is specifically: a question naming a DIFFERENT domain while
+    the plan claims an unreferenced table — planner noise, not enforced."""
+    if not question:
+        return True
+    tokens = set(re.findall(r"[a-z0-9]+", question.lower()))
+    return bool(tokens & _table_lexemes(entity))
 
 
 def repair_metric_column(sql: str, plan: Optional[dict], table_schemas: dict,
@@ -1686,7 +2553,41 @@ def repair_metric_column(sql: str, plan: Optional[dict], table_schemas: dict,
 # must resolve somewhere among the queried tables (2+ owners = the classic
 # ambiguous-CustomerId failure, now rejected HERE with an actionable
 # "qualify it" message instead of a cryptic sqlite error three lines later).
+#
+# Scope-aware (§6.27): a bare column inside a scalar subquery — e.g. the
+# "(SELECT MAX(UnitPrice) FROM Track)" llama3.2 naturally writes for
+# most-expensive questions — resolves to THAT subquery's FROM clause by
+# standard SQL name resolution, and flagging it against the OUTER query's
+# table set was a false AMBIGUOUS rejection that killed all three retries.
+# Unqualified columns are now judged against their nearest enclosing
+# SELECT's tables; scopes containing tables we hold no schema for are left
+# alone entirely.
 # ---------------------------------------------------------------------------
+
+def _enclosing_select(node: exp.Expression, root) -> Optional[exp.Select]:
+    cur = node
+    while cur.parent is not None:
+        cur = cur.parent
+        if isinstance(cur, exp.Select):
+            return cur
+    return root if isinstance(root, exp.Select) else None
+
+
+def _scope_tables(sel: exp.Select) -> set:
+    """Tables this SELECT's FROM/JOINs declare — the resolution scope for
+    its unqualified columns. Note the sqlglot arg-name trap (§6.25): the
+    FROM clause is stored under 'from_' in some versions and 'from' in
+    others, so probe both before concluding a query has no FROM at all."""
+    tabs: set = set()
+    frm = sel.args.get("from")
+    if frm is None:
+        frm = sel.args.get("from_")
+    if frm is not None:
+        tabs |= {t.name for t in frm.find_all(exp.Table)}
+    for join in sel.args.get("joins") or []:
+        tabs |= {t.name for t in join.find_all(exp.Table)}
+    return tabs
+
 
 def validate_columns_exist(sql: str, table_schemas: dict, dialect: str = "") -> None:
     import difflib
@@ -1739,17 +2640,22 @@ def validate_columns_exist(sql: str, table_schemas: dict, dialect: str = "") -> 
                     f"Check the schema above and use an existing column."
                 )
         else:
-            # Unqualified: must resolve among the queried tables well enough
-            # to execute. 0 owners = unknown column; 2+ owners restricted to
-            # the joined set = ambiguous exactly like sqlite's error, but
-            # with the fix stated up front.
+            # Unqualified: must resolve among the tables of its own scope
+            # (nearest enclosing SELECT), not the whole query — see §6.27.
+            scope = _enclosing_select(col, ast)
+            scope_tabs = _scope_tables(scope) if scope is not None else set()
+            known_scope = {t for t in scope_tabs if t in lowered}
+            if scope_tabs and not known_scope:
+                continue  # scope over derived/CTE tables we can't judge
+            pool = known_scope or query_tables
             in_query = [t for t in owners_index.get(name_l, [])
-                        if t in query_tables]
+                        if t in pool]
             if len(in_query) == 0:
                 all_owners = owners_index.get(name_l, [])
-                pool = set().union(*(lowered[t] for t in query_tables
-                                     if t in lowered)) if query_tables else set()
-                similar = _suggest(col.name, pool)
+                similar_pool = (set().union(*(lowered[t] for t in pool
+                                              if t in lowered))
+                                if pool else set())
+                similar = _suggest(col.name, similar_pool)
                 hint = f" (it exists on {sorted(all_owners)}, which are not part of this query)" if all_owners else ""
                 raise SemanticValidationError(
                     f"Column '{col.name}' is not provided by any table in "
@@ -2277,17 +3183,14 @@ def _strip_list_markers(text: str) -> str:
     mistaken for data values during number extraction — done via actual
     list-marker pattern matching, not a blanket 'small numbers are probably
     an index' guess (which turned out to let real hallucinated small counts,
-    e.g. a fabricated '15', slip through unflagged)."""
-    return re.sub(r"(?m)^\s*\d+[.)]\s+", "", text)
+    e.g. a fabricated '15', slip through unflagged).
 
-
-def _strip_list_markers(text: str) -> str:
-    """Remove leading list markers ('1. ', '2) ', etc.) so they aren't
-    mistaken for data values during number extraction — done via actual
-    list-marker pattern matching, not a blanket 'small numbers are probably
-    an index' guess (which turned out to let real hallucinated small counts,
-    e.g. a fabricated '15', slip through unflagged)."""
-    return re.sub(r"(?m)^\s*\d+[.)]\s+", "", text)
+    The marker may also END the text with no trailing whitespace: sentence
+    splitting treats each marker's dot as a sentence ender ("…25.86\\n2." +
+    "Richard…"), so numbered-list segments routinely arrive truncated right
+    after "N." — observed live as the checker citing the NEXT item's index
+    for the current entity (W-003#2)."""
+    return re.sub(r"(?m)^\s*\d+[.)](?:\s+|$)", "", text)
 
 
 # Negative lookbehind/lookahead for a letter excludes digits embedded in an
@@ -2375,6 +3278,288 @@ def verify_answer(answer: str, result: dict) -> list:
     raw = _extract_numbers_from_rows(result)
     unverified = [v for v, dec in _answer_figures(answer) if not _grounded(v, dec, raw)]
     return sorted(unverified)
+
+
+# ---------------------------------------------------------------------------
+# Row-aware attribution verification. verify_answer above is deliberately
+# row-AGNOSTIC: every number just has to exist SOMEWHERE in the result set.
+# Observed live failure that motivates this section: 58 customers tied at
+# rank 1 and the formatter picked ONE arbitrarily ("Luís Gonçalves … unit
+# price of 1.99") — every cited figure traced to some row, verification
+# passed, yet the answer attributed THE win to a row the query never
+# uniquely selected. This layer checks ENTITY↔FIGURE BINDING, conservatively:
+# it only speaks up when a named entity unambiguously resolves to one row,
+# or when a tie-set was silently collapsed to a single winner.
+# ---------------------------------------------------------------------------
+
+_SENTENCE_SPLIT_RE = re.compile(
+    r"(?<=[.!?;])\s+"                  # sentence / clause enders
+    r"|,\s+and\s+(?=[A-ZÀ-ÖØ-Þ])"      # listings: "...spent 10, and Bob spent 20"
+)
+_PROPER_NOUN_RE = re.compile(
+    r"\b[A-ZÀ-ÖØ-Þ][\w'’\-]*(?:\s+[A-ZÀ-ÖØ-Þ][\w'’\-]*)+\b"
+)
+_TIE_ACKNOWLEDGMENT_RE = re.compile(
+    r"\b(?:tied|tie|both|all\s+(?:of\s+)?(?:them|\d+)|others?|along\s+with|"
+    r"together|among|several|multiple|one\s+of)\b",
+    re.IGNORECASE,
+)
+
+
+def _norm_text(s: str) -> str:
+    """Accent/case-insensitive normalization so 'Luís' matches 'luis' —
+    LLM answers routinely drop diacritics the DB stores."""
+    return " ".join(
+        unicodedata.normalize("NFKD", s)
+        .encode("ascii", "ignore").decode().lower().split()
+    )
+
+
+def _norm_with_map(s: str):
+    """_norm_text that remembers provenance: returns (normalized, idx_map)
+    where idx_map[j] is the index in `s` of the character that produced
+    normalized[j]. Matches found in normalized space can therefore be cut
+    back out of the ORIGINAL sentence — needed to attribute specific
+    figures to specific entities by their position in the text."""
+    out, idx_map = [], []
+    prev_space = True
+    for i, ch in enumerate(unicodedata.normalize("NFKD", s)):
+        if unicodedata.combining(ch):
+            continue
+        c = ch.lower()
+        if c.isspace():
+            if prev_space:
+                continue
+            c, prev_space = " ", True
+        else:
+            prev_space = False
+        out.append(c)
+        idx_map.append(i)
+    return "".join(out), idx_map
+
+
+def _row_numbers(row: list) -> set:
+    nums = set()
+    for val in row:
+        if isinstance(val, bool):
+            continue
+        if isinstance(val, (int, float)):
+            nums.add(float(val))
+        elif isinstance(val, str):
+            v = _to_number(val.strip())
+            if v is not None:
+                nums.add(v)
+    return nums
+
+
+def _is_entity_cell(text: str) -> bool:
+    """A string cell is an ENTITY candidate only if it isn't just a number
+    in disguise — Postgres NUMERIC arrives through MCP JSON as strings
+    (§6.16), and '99.98' matching its own citation position would gut the
+    segment-ownership model."""
+    return _to_number(text.strip()) is None
+
+
+def _cell_prefix(cell_norm: str) -> Optional[str]:
+    """Leading two-token window of a 3+-token entity name ('johannes van
+    der berg' -> 'johannes van'). Length-guarded so it can only ever be a
+    meaningful partial citation (W-003#3)."""
+    parts = cell_norm.split()
+    if len(parts) <= 2:
+        return None
+    prefix = " ".join(parts[:2])
+    return prefix if len(prefix) >= 6 else None
+
+
+def _sentence_entities(sentence_norm: str, row_cells: list) -> dict:
+    """Which result rows does this sentence name? Maps original cell text ->
+    set of row indices whose string cells appear (accent-normalized) in
+    the sentence. Cells shorter than 3 chars are skipped ('U2' rule)."""
+    found = {}
+    for i, cells in enumerate(row_cells):
+        for c in cells:
+            if not _is_entity_cell(c):
+                continue
+            norm_cell = _norm_text(c)
+            if len(norm_cell) < 3:
+                continue
+            if norm_cell in sentence_norm:
+                found.setdefault(c, set()).add(i)
+                continue
+            # unique-prefix fallback (W-003#3): 'Johannes Van' cited for
+            # 'Johannes Van der Berg' — the truncated citation is still an
+            # unambiguous reference to this row's entity.
+            pfx = _cell_prefix(norm_cell)
+            if pfx and pfx in sentence_norm:
+                found.setdefault(c, set()).add(i)
+    return found
+
+
+def _entity_mentions(sentence: str, row_cells: list) -> list:
+    """Entity mentions with ORIGINAL-sentence offsets, ordered by position:
+    [(start, end, cell_text, {row_ids}), ...]. Aggregates rows per text
+    first so a name occurring in several rows stays ambiguous as a whole."""
+    sent_norm, idx_map = _norm_with_map(sentence)
+    by_text = {}
+    for i, cells in enumerate(row_cells):
+        for c in cells:
+            if not _is_entity_cell(c):
+                continue
+            nc = _norm_text(c)
+            hit = nc if (len(nc) >= 3 and nc in sent_norm) else None
+            if hit is None:
+                pfx = _cell_prefix(nc)
+                if pfx and pfx in sent_norm:
+                    hit = pfx
+            if hit is not None:
+                by_text.setdefault(c, set()).add(i)
+                by_text.setdefault("__span__" + c, hit)
+    mentions = []
+    for c, rids in by_text.items():
+        if c.startswith("__span__"):
+            continue  # span bookkeeping entry, not an entity
+        nc = _norm_text(c)
+        hit = by_text.get("__span__" + c, nc)
+        pos = sent_norm.find(hit)
+        mentions.append((idx_map[pos], idx_map[pos + len(hit) - 1] + 1, c,
+                         rids))
+    mentions.sort()
+    return mentions
+
+
+def verify_row_attribution(answer: str, result: dict, sql: str = "") -> list:
+    """Row-level attribution issues in the final answer, as plain-language
+    strings (empty = no binding problems detected). Three conservative
+    checks, each silent unless its preconditions are unambiguous:
+
+    1. FABRICATED ENTITY — a multi-word proper noun appears in a
+       figure-bearing sentence but matches no string cell in any row.
+       Only fires when the result actually HAS string columns.
+    2. CROSS-ROW FIGURE — a sentence names an entity resolving to exactly
+       ONE row, but cites figures grounded only in OTHER rows.
+    3. TIE ARBITRARY-PICK — the tie-aware RANK() rewrite returned several
+       top-ranked rows, yet the answer presents exactly one entity as the
+       sole winner without acknowledging the tie.
+
+    Deliberately NOT checked: paraphrases without DB-string mentions,
+    ambiguous entities spanning multiple rows, and listings naming many
+    entities (each sentence is judged independently)."""
+    rows = result.get("rows", []) or []
+    if not rows:
+        return []
+
+    # Index string cells per row (original text; matching normalizes on
+    # the fly so 'Luís' in the DB matches 'luis' in the answer).
+    row_cells: list = []
+    has_string_cells = False
+    for row in rows:
+        cells = [v for v in row if isinstance(v, str)]
+        has_string_cells = has_string_cells or bool(cells)
+        row_cells.append(cells)
+
+    row_count = float(len(rows))
+    universal = None
+    if len(rows) > 1:
+        sets_ = [_row_numbers(r) for r in rows]
+        universal = set.intersection(*sets_) if sets_ else set()
+
+    issues = []
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(answer or "") if s.strip()]
+    # Multi-token names usually span ADJACENT cells of one row ("Luís" +
+    # "Gonçalves" cited as "Luis Goncalves"), so the fabricated-entity
+    # index includes same-row pair concatenations too.
+    all_cells_norm = set()
+    for cells in row_cells:
+        norms = [_norm_text(c) for c in cells]
+        all_cells_norm.update(n for n in norms if len(n) >= 3)
+        for a in norms:
+            for b in norms:
+                if a != b:
+                    joined = f"{a} {b}"
+                    if len(joined) >= 3:
+                        all_cells_norm.add(joined)
+            # unique-prefix fallback (W-003#3): truncated citations like
+            # 'Johannes Van' reference this entity even though the full
+            # cell never appears verbatim
+            pfx = _cell_prefix(a)
+            if pfx:
+                all_cells_norm.add(pfx)
+
+    # ---- Checks 1 & 2, per sentence ----
+    for sentence in sentences:
+        figs_all = _answer_figures(_strip_list_markers(sentence))
+        if not figs_all:
+            continue
+        sent_norm = _norm_text(sentence)
+
+        if has_string_cells:
+            for span in _PROPER_NOUN_RE.findall(sentence):
+                if _norm_text(span) not in all_cells_norm:
+                    issues.append(
+                        f"ROW ATTRIBUTION: '{span}' is cited alongside "
+                        f"figures but does not appear anywhere in the "
+                        f"result rows.")
+
+        def _bind(text, row_ids, seg_figs):
+            if len(row_ids) != 1 or not seg_figs:
+                return  # ambiguous across rows — don't guess attribution
+            rid = next(iter(row_ids))
+            allowed = _row_numbers(rows[rid])
+            if universal:
+                allowed |= universal  # values uniform across all rows are
+            allowed.add(row_count)    # not row-specific evidence either way
+            unbound = [v for v, dec in seg_figs
+                       if not _grounded(v, dec, allowed)]
+            if unbound:
+                pretty = ", ".join(f"{n:g}" for n in sorted(unbound))
+                issues.append(
+                    f"ROW ATTRIBUTION: {pretty} "
+                    f"{'is' if len(unbound) == 1 else 'are'} "
+                    f"cited for '{text}', but "
+                    f"{'that figure is' if len(unbound) == 1 else 'those figures are'} "
+                    f"not among the query results for that entity's row "
+                    f"(they belong to other rows).")
+
+        mentions = _entity_mentions(sentence, row_cells)
+        if len(mentions) <= 1:
+            # Single subject: every figure in the sentence is its claim.
+            for text, rids in [(m[2], m[3]) for m in mentions]:
+                _bind(text, rids, figs_all)
+        else:
+            # Listing: each entity owns only the figures BETWEEN itself and
+            # the next mention. Figures after the LAST mention bind to it
+            # too — UNLESS the sentence shows shared/tie vocabulary ("A and
+            # B are tied at 38", "their combined total"), in which case a
+            # trailing number belongs to nobody in particular and is
+            # deliberately exempt rather than guessed at.
+            shared_tail = bool(_TIE_ACKNOWLEDGMENT_RE.search(sentence))
+            for i, (_, end_, text, rids) in enumerate(mentions):
+                if i + 1 < len(mentions):
+                    seg = sentence[end_:mentions[i + 1][0]]
+                else:
+                    seg = "" if shared_tail else sentence[end_:]
+                _bind(text, rids, _answer_figures(_strip_list_markers(seg)))
+
+    # ---- Check 3: tie arbitrary-pick ----
+    if "__rnk" in (sql or "") and len(rows) > 1:
+        top_ties = [r for r in rows
+                    if isinstance(r[-1], (int, float))
+                    and float(r[-1]) == 1.0]
+        if len(top_ties) > 1:
+            named_rows = set()
+            for s in sentences:
+                for _, rids in _sentence_entities(
+                        _norm_text(s), row_cells).items():
+                    named_rows |= rids
+            acknowledged = bool(_TIE_ACKNOWLEDGMENT_RE.search(answer))
+            if len(named_rows) == 1 and not acknowledged:
+                issues.append(
+                    f"ROW ATTRIBUTION: the query returned {len(top_ties)} "
+                    f"tied rows, but the answer singles out one entity as "
+                    f"the winner; no single row was selected by the query "
+                    f"— report the tie instead of picking from tied rows.")
+
+    return issues
 
 
 # ---------------------------------------------------------------------------
@@ -2669,7 +3854,10 @@ class SQLAgent:
             '"limit": <int or null>} — enabled only for top/bottom/best/first-N '
             "questions.\n"
             '- "grouping": column to group by for per-X breakdowns ("per '
-            'customer"), or null.\n\n'
+            'customer"), or null.\n'
+            '- "result_shape": "list" when the question asks to enumerate '
+            '(list / name / which / show all), "scalar" for one value '
+            '(how many / total / average / extreme), or null.\n\n'
             "Respond with ONLY the JSON object, nothing else."
         )
         text = await self._call_llm(prompt, "pick_tables")
@@ -2694,10 +3882,25 @@ class SQLAgent:
             # with metric=SUM — obeying it would have rejected perfectly
             # good non-aggregated SQL.
             if metric != "NONE" and not (
-                _MONEY_TERM_RE.search(question) or _COUNT_INTENT_RE.search(question)
+                _MONEY_TERM_RE.search(question)
+                or _COUNT_INTENT_RE.search(question)
+                # Price superlatives ("most expensive"/"cheapest") demand
+                # an exact extreme that neither money nor count vocabulary
+                # covers — when the question's polarity matches the claimed
+                # metric EXACTLY, the claim is corroborated by the question
+                # itself (§6.24a discipline holds: narrow regexes only) and
+                # validate_plan_matches_sql then hard-enforces MAX/MIN.
+                or agg_polarity_for_question(question) == metric
             ):
                 logger.info(f"[pick_tables] plan claimed metric={metric} but the "
                             f"question shows no aggregation language - ignoring")
+                # No trusted plan metric — record what the question itself
+                # implies instead of leaving validation empty-handed. Weak
+                # signal: only ever used to VETO an unrelated ranking
+                # target (validate_ranking_target), never to force a form.
+                inferred = infer_measure_dimension(question)
+                if inferred:
+                    plan["metric_inferred"] = inferred
             else:
                 plan["metric"] = metric
         ranking = raw.get("ranking")
@@ -2726,6 +3929,14 @@ class SQLAgent:
             plan["metric_column"] = str(raw["metric_column"])
         if raw.get("grouping"):
             plan["grouping"] = str(raw["grouping"])
+        raw_shape = str(raw.get("result_shape") or "").lower()
+        expected_shape = infer_result_shape(question)
+        # trust the planner's shape claim ONLY when the question itself
+        # corroborates it (same §6.24a discipline as metric/ranking claims)
+        if raw_shape in ("list", "scalar") and raw_shape == expected_shape:
+            plan["result_shape"] = raw_shape
+        elif expected_shape:
+            plan["result_shape"] = expected_shape  # lexical fallback
         return picked, plan
 
     # ---- Step 3: generate SQL ----
@@ -2780,6 +3991,14 @@ class SQLAgent:
 
     # ---- Step 7: format final answer ----
     async def format_answer(self, question: str, sql: str, result: dict, correction_note: str = "") -> str:
+        rows_all = result.get("rows") or []
+        if len(rows_all) > FORMAT_PREVIEW_ROW_LIMIT:
+            logger.info(f"[format_answer] {len(rows_all)} rows exceed "
+                        f"{FORMAT_PREVIEW_ROW_LIMIT} — deterministic "
+                        f"preview (W-004: LLM formatting collapses on "
+                        f"large listings and verifies vacuously)")
+            self.metrics.preview_used = True
+            return _render_result_preview(result)
         prompt = (
             f"Question: {question}\n\n"
             f"SQL used: {sql}\n\n"
@@ -2816,6 +4035,26 @@ class SQLAgent:
                 "Model produced no answer text (reasoning consumed the entire "
                 "token budget twice). Re-run with a higher --max-tokens."
             )
+        # W-004 sanity gate: an answer that references NO column, string
+        # cell, or numeric cell is detached from the data (observed live on
+        # a 3503-row listing: "There is no question to answer..."). One
+        # corrective re-invoke, then fall back to the deterministic render —
+        # meta-garbage never ships.
+        if rows_all and not _answer_touches_result(answer, result):
+            logger.warning("[format_answer] answer does not reference any "
+                           "result data — retrying with rows demanded")
+            answer = await self._call_llm(
+                prompt + "\n\nIMPORTANT: Your previous reply did not "
+                "reference the actual result data. Output the result rows "
+                "themselves as a readable table or list.",
+                "format_answer",
+            )
+            if not answer or not _answer_touches_result(answer, result):
+                logger.warning("[format_answer] formatter still detached "
+                               "from results — shipping deterministic "
+                               "preview instead")
+                self.metrics.preview_used = True
+                return _render_result_preview(result)
         return answer
 
     def _build_schema_context(self, table_schemas: dict, foreign_keys: list, relevant: list) -> str:
@@ -2976,6 +4215,7 @@ class SQLAgent:
             prev_attempt_sql = None
 
             # Step 6: explicit, bounded retry loop
+            self._last_overvalidation = None  # per-question guard state
             for attempt in range(self.max_retries + 1):
                 self.metrics.attempts += 1
                 sql = await self.generate_sql(question, schema_context, error_context)
@@ -3023,12 +4263,24 @@ class SQLAgent:
                     # relationship anywhere in the schema.
                     try:
                         validate_join_semantics(sql, foreign_keys, _sqlglot_dialect(self.dialect))
+                        validate_join_connectivity(sql, foreign_keys, _sqlglot_dialect(self.dialect))
                     except SemanticValidationError as e:
                         self._tag_failure(e)
                         self.metrics.semantic_rejections += 1
                         if not self._repair_budget_left():
                             self.metrics.repairs_skipped += 1
                             raise  # budget exhausted: LLM retry instead
+                        # deterministic reconnect first (fix #3 second half):
+                        # AND-append the hinted FK edge to the right JOIN
+                        repaired_conn = repair_join_connectivity(
+                            sql, foreign_keys, _sqlglot_dialect(self.dialect))
+                        if repaired_conn != sql:
+                            sql = repaired_conn
+                            self.validate_sql(sql)
+                            self.metrics.repairs_applied += 1
+                            validate_join_semantics(sql, foreign_keys, _sqlglot_dialect(self.dialect))
+                            validate_join_connectivity(sql, foreign_keys, _sqlglot_dialect(self.dialect))
+                            continue
                         # Before giving up on this attempt (and burning a
                         # full LLM retry), check whether a real FK path
                         # exists between the two tables via BFS over the FK
@@ -3044,6 +4296,7 @@ class SQLAgent:
                         self.metrics.repairs_applied += 1
                         self.validate_sql(sql)
                         validate_join_semantics(sql, foreign_keys, _sqlglot_dialect(self.dialect))
+                        validate_join_connectivity(sql, foreign_keys, _sqlglot_dialect(self.dialect))
                     # Column-existence check now runs AFTER join repair:
                     # repaired shapes legitimately change which columns are
                     # referenced, so hallucinated-column rejection must not
@@ -3090,6 +4343,17 @@ class SQLAgent:
                         self.metrics.repairs_applied += 1
                         validate_aggregation_fanout(sql, foreign_keys, table_schemas,
                                                     _sqlglot_dialect(self.dialect))
+                    # Fix #10 — double-aggregation guard (semantic_error):
+                    # independent measure-semantics net; reject+retry only,
+                    # no deterministic repair by deliberate choice.
+                    try:
+                        validate_measure_expression(sql, table_schemas,
+                                                    foreign_keys,
+                                                    _sqlglot_dialect(self.dialect))
+                    except SemanticValidationError as e:
+                        self._tag_failure(e)
+                        self.metrics.semantic_rejections += 1
+                        raise
                     # Metric-intent check — question says money ("spent",
                     # "revenue") but query only COUNTs, or asks how-many but
                     # query SUMs; plus the integer-measure guard (money
@@ -3098,6 +4362,32 @@ class SQLAgent:
                         validate_metric_intent(question, sql,
                                                _sqlglot_dialect(self.dialect),
                                                table_schemas=table_schemas)
+                    except SemanticValidationError as e:
+                        self._tag_failure(e)
+                        self.metrics.semantic_rejections += 1
+                        raise
+                    # Fix #8 — dimension-grain anchor (wrong_grain): scalar
+                    # aggregates over a corroborated entity must compute
+                    # FROM that entity's rows, not a joined detail table.
+                    try:
+                        validate_aggregation_grain(
+                            sql, question, query_plan, table_schemas,
+                            foreign_keys, _sqlglot_dialect(self.dialect))
+                    except SemanticValidationError as e:
+                        self._tag_failure(e)
+                        self.metrics.semantic_rejections += 1
+                        raise
+                    # Ranking-target check — when the question implies WHAT
+                    # to rank by (price / quantity / money) but the plan
+                    # carried no trusted metric, the ORDER BY must still
+                    # target a column of that family. Catches the observed
+                    # "most expensive track" answered by SUM(Quantity)
+                    # ranking: structurally valid, verified, wrong metric.
+                    try:
+                        validate_ranking_target(question, sql,
+                                                _sqlglot_dialect(self.dialect),
+                                                table_schemas=table_schemas,
+                                                plan=query_plan)
                     except SemanticValidationError as e:
                         self._tag_failure(e)
                         self.metrics.semantic_rejections += 1
@@ -3115,23 +4405,53 @@ class SQLAgent:
                                                   table_schemas=table_schemas,
                                                   question=question)
                     except SemanticValidationError as e:
+                        # Bounded-stubbornness guard (W-007): an identical
+                        # overvalidation rejection twice in a row means the
+                        # model cannot satisfy the demand — a third identical
+                        # death helps nobody. Accept the repeat with a
+                        # warning instead of burning every retry on one
+                        # hallucinated plan claim.
+                        if getattr(e, "category", "") == "overvalidation" \
+                                and str(e) == getattr(
+                                    self, "_last_overvalidation", None):
+                            logger.warning(
+                                "[plan] identical overvalidation rejection "
+                                "repeated — downgrading to warning and "
+                                "accepting this attempt")
+                            self._last_overvalidation = None
+                            self._tag_failure(e)
+                            self.metrics.semantic_rejections += 1
+                        else:
+                            if getattr(e, "category", "") == "overvalidation":
+                                self._last_overvalidation = str(e)
+                            self._tag_failure(e)
+                            self.metrics.semantic_rejections += 1
+                            if not self._repair_budget_left():
+                                self.metrics.repairs_skipped += 1
+                                raise
+                            repaired = repair_metric_column(sql, query_plan,
+                                                            table_schemas,
+                                                            _sqlglot_dialect(self.dialect))
+                            if repaired == sql:
+                                raise  # nothing we could deterministically fix
+                            sql = repaired
+                            self.validate_sql(sql)
+                            self.metrics.repairs_applied += 1
+                            validate_plan_matches_sql(query_plan, sql,
+                                                      _sqlglot_dialect(self.dialect),
+                                                      table_schemas=table_schemas,
+                                                      question=question)
+                    # Fix #6 — unsolicited-LIMIT scope-drift check
+                    # (scope_drift): plan has no ranking + no N/superlative
+                    # vocabulary + top-level LIMIT on a listing => reject.
+                    try:
+                        validate_unsolicited_limit(
+                            sql, question, query_plan, table_schemas,
+                            foreign_keys, _sqlglot_dialect(self.dialect))
+                    except SemanticValidationError as e:
                         self._tag_failure(e)
                         self.metrics.semantic_rejections += 1
-                        if not self._repair_budget_left():
-                            self.metrics.repairs_skipped += 1
-                            raise
-                        repaired = repair_metric_column(sql, query_plan,
-                                                        table_schemas,
-                                                        _sqlglot_dialect(self.dialect))
-                        if repaired == sql:
-                            raise  # nothing we could deterministically fix
-                        sql = repaired
-                        self.validate_sql(sql)
-                        self.metrics.repairs_applied += 1
-                        validate_plan_matches_sql(query_plan, sql,
-                                                  _sqlglot_dialect(self.dialect),
-                                                  table_schemas=table_schemas,
-                                                  question=question)
+                        raise
                     # Count-grain check — 'purchases'/'invoices'-style
                     # questions must be counted at the document grain, not a
                     # detail-line grain. Deterministic retarget first.
@@ -3267,8 +4587,6 @@ class SQLAgent:
                             r_new = await self.execute_sql(probe_new)
                             v_old = r_old.get("rows", [[None]])[0][0]
                             v_new = r_new.get("rows", [[None]])[0][0]
-                            import sys as _s3
-                            print(f"DBG3 v_old={v_old!r} v_new={v_new!r}", file=_s3.stderr)
                             if v_old is not None and v_new is not None:
                                 tol = 0.005 * max(abs(float(v_old)),
                                                   abs(float(v_new)), 1.0)
@@ -3343,34 +4661,65 @@ class SQLAgent:
             # bad final answer if the LLM editorializes when writing it up
             # — an observed real failure was the model appending a
             # fabricated "(likely a typo)" note instead of trusting the
-            # DB's actual value. Check that every number in the answer
-            # traces back to the real result set; if not, give the model
-            # one corrective retry with the mismatch called out explicitly.
-            unverified = verify_answer(answer, result)
+            # DB's actual value. Two layers: verify_answer checks every
+            # NUMBER traces to the result set; verify_row_attribution
+            # checks figures are attributed to the RIGHT ROW (entity↔figure
+            # binding, tie handling). Either failing gets one corrective
+            # retry with the specifics called out, then a visible banner.
+            # Deterministic previews (W-004 fix) skip verification: every
+            # byte comes from result cells, and digit-bearing names in a
+            # table layout would trip figure extraction false-positively.
+            if not self.metrics.preview_used:
+                unverified = verify_answer(answer, result)
+                attribution = verify_row_attribution(answer, result, sql=sql)
+            else:
+                unverified, attribution = [], []
             if unverified:
                 self._tag_failure(
                     SemanticValidationError("could not be fully verified"))
-            if unverified:
-                self._tag_failure(
-                    SemanticValidationError("could not be fully verified"))
-            self.metrics.answer_verified = not unverified
-            if unverified:
-                pretty = ", ".join(f"{n:g}" for n in unverified)
-                logger.warning(f"[verify] Answer contains number(s) not found in the "
-                                f"query results: {pretty} — retrying format_answer once.")
+            for issue in attribution:
+                self._tag_failure(SemanticValidationError(issue))
+            self.metrics.answer_verified = not (unverified or attribution)
+            if self.metrics.preview_used:
+                return answer, sql, self.metrics
+            if unverified or attribution:
+                # ONE corrective retry total — the counter tracks retries,
+                # not how many layers flagged the same answer.
                 self.metrics.verification_retries += 1
-                correction_note = (
-                    "\n\nIMPORTANT: Your previous answer included the number(s) "
-                    f"{pretty}, which do NOT appear anywhere in the result rows "
-                    "above. Use ONLY the exact values shown in the rows — do not "
-                    "alter, round unexpectedly, invent, or 'correct' any figure."
-                )
+                if attribution:
+                    logger.warning("[verify] Row-attribution issue(s): "
+                                   + " | ".join(attribution))
+                correction_note = ""
+                if unverified:
+                    pretty = ", ".join(f"{n:g}" for n in unverified)
+                    logger.warning(f"[verify] Answer contains number(s) not found "
+                                    f"in the query results: {pretty} — retrying "
+                                    f"format_answer once.")
+                    correction_note = (
+                        "\n\nIMPORTANT: Your previous answer included the number(s) "
+                        f"{pretty}, which do NOT appear anywhere in the result rows "
+                        "above. Use ONLY the exact values shown in the rows — do not "
+                        "alter, round unexpectedly, invent, or 'correct' any figure."
+                    )
+                if attribution:
+                    correction_note += (
+                        "\n\nIMPORTANT: Your previous answer misattributed the data: "
+                        + " ".join(attribution)
+                        + "\nRewrite the answer so every figure belongs to the entity "
+                          "it is cited for; if several rows are tied, report the tie "
+                          "instead of naming a single winner."
+                    )
                 answer = await self.format_answer(question, sql, result, correction_note)
                 still_unverified = verify_answer(answer, result)
-                self.metrics.answer_verified = not still_unverified
+                still_attrib = verify_row_attribution(answer, result, sql=sql)
+                self.metrics.answer_verified = not (still_unverified or still_attrib)
                 if still_unverified:
                     logger.warning(f"[verify] Still unverified after retry: "
                                    f"{', '.join(f'{n:g}' for n in still_unverified)}")
+                if still_attrib:
+                    logger.warning("[verify] Attribution still unresolved after "
+                                   "retry: " + " | ".join(still_attrib))
+                if still_unverified or still_attrib:
                     answer += (
                         "\n\n⚠️ Note: this answer could not be fully verified against "
                         "the raw query results — please double-check the figures above."

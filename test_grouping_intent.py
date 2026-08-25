@@ -34,7 +34,7 @@ async def main():
     llm = FakeLLM([
         BAD_SQL,
         GOOD_SQL,
-        "Here is the average order ID per customer.",  # format_answer
+        "The avg_val column below shows the average order ID per customer.",  # format_answer
     ])
     agent = SQLAgent(
         db_url=PG_URL,
