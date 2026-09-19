@@ -6,6 +6,9 @@ history of observed failures and what was built in response, and what to do
 next. For environment setup on a fresh machine, read [SETUP_TESTS.md](SETUP_TESTS.md)
 alongside this file.
 
+The ordered implementation plan is maintained in
+[PROJECT_ROADMAP.md](PROJECT_ROADMAP.md).
+
 ---
 
 ## 1. Status snapshot
@@ -311,7 +314,9 @@ up and falls back to Postgres otherwise.
    live-model test once a CI runner can host one.
 8. **Deployment surface (landed)**: `api.py` exposes the explicit read-only
    pipeline through FastAPI, serves the browser UI from `static/index.html`,
-   and provides `/health/live`, `/health/ready`, and `/v1/query`. The local
-   default is Ollama with `llama3.2:latest`; Docker Compose runs the API and
-   Ollama together. Full operator instructions, exact commands, failure
-   diagnosis, and the API/UI/Docker distinction are in `DEPLOYMENT.md`.
+   and provides `/health/live`, `/health/ready`, and `/v1/query`. Readiness
+   now checks the database and configured LLM model, and every response carries
+   an `X-Request-ID`. The local default is Ollama with `llama3.2:latest`;
+   Docker Compose runs the API and Ollama together, with SQLite and HTTPS
+   overrides. Full operator instructions, exact commands, failure diagnosis,
+   and the API/UI/Docker distinction are in `DEPLOYMENT.md`.

@@ -1,5 +1,8 @@
 # DB-Agent — Multilingual Autonomous Database Agent
 
+Project execution priorities are tracked in
+[PROJECT_ROADMAP.md](PROJECT_ROADMAP.md).
+
 A natural-language-to-SQL query agent with an **explicit, inspectable control loop** — no ReAct black box. Ask questions about your database in any language, in plain English or with meaning-based ("find products described as durable") searches, and get back verified answers.
 
 Every LLM call and tool call happens exactly where the code says it does, in the order it says, with metrics to prove it. Wrong SQL is not just retried — whole classes of mistakes are **detected and repaired deterministically** before they ever reach the database.
@@ -205,6 +208,13 @@ Every question is classified on failure (join / grain / aggregation / column-hal
 ├── production_agent.py    # Agentic (create_agent) variant, LLM factory shared by all
 ├── agent.py               # Original v0.1 ReAct loop — DEPRECATED, kept for reference
 ├── db_mcp_server.py       # Security-reviewed read-only MCP server (AST validated)
+├── api.py                 # FastAPI API, readiness checks, request IDs, and UI host
+├── static/index.html       # Browser UI served by the API
+├── Dockerfile              # Production API image
+├── docker-compose.production.yml
+├── docker-compose.sqlite.yml
+├── docker-compose.https.yml
+├── Caddyfile              # HTTPS reverse-proxy configuration
 ├── vector_store.py        # chromadb-backed semantic store, pluggable embedders
 ├── benchmark.py           # Accuracy harness: exact-match / exec-accuracy / retry /
 │                          # hallucination rates + failure-class breakdown vs golds
@@ -215,6 +225,7 @@ Every question is classified on failure (join / grain / aggregation / column-hal
 ├── tests/test_*.py        # 23 self-contained end-to-end tests (in tests/)
 ├── SETUP_TESTS.md         # Fresh-machine environment setup guide
 ├── DEPLOYMENT.md          # API, browser UI, Docker, Ollama, and troubleshooting
+├── PROJECT_ROADMAP.md      # Prioritized production and product work plan
 ├── PROJECT_HANDOFF.md     # Design decisions, bug-history compendium, roadmap
 ├── PROJECT_MEMORY_LOG.md  # Running bug/history log — one ML-nnn entry per bug/fix
 ├── WRONG_ANSWERS.md       # Live-answer ledger + per-bug evidence (append-only)

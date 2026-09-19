@@ -301,22 +301,53 @@ docker compose -f docker-compose.production.yml down -v
 
 Do not use `down -v` unless you intentionally want to download the model again.
 
-### 7.2 Docker with the bundled SQLite demo
+### 7.4 HTTPS with Caddy
 
-The SQLite file must be mounted into the API container read-only. Add this
-under the `agent` service in `docker-compose.production.yml`:
+For a public deployment, use the HTTPS override so Uvicorn is not exposed
+directly. Point a DNS A/AAAA record at the server first, then run:
 
-```yaml
-    volumes:
-      - ./chinook.db:/app/chinook.db:ro
+```bash
+export DOMAIN="db-agent.example.com"
+export DATABASE_URL="postgresql+psycopg2://readonly_user:PASSWORD@db.example.com:5432/appdb"
+export API_TOKEN="$(openssl rand -hex 32)"
+
+docker compose \
+  -f docker-compose.production.yml \
+  -f docker-compose.https.yml \
+  up -d --build
 ```
 
-Then run:
+Caddy obtains and renews the certificate automatically. The public endpoints
+are then:
+
+```text
+https://db-agent.example.com/
+https://db-agent.example.com/docs
+```
+
+The HTTPS override publishes ports 80 and 443 from Caddy and keeps the agent
+on the private Compose network. Do not publish port 8000 on the firewall for
+this mode. Inspect the proxy:
+
+```bash
+docker compose \
+  -f docker-compose.production.yml \
+  -f docker-compose.https.yml \
+  logs -f caddy
+```
+
+### 7.2 Docker with the bundled SQLite demo
+
+The SQLite file must be mounted into the API container read-only. Use the
+SQLite Compose override:
 
 ```bash
 export DATABASE_URL="sqlite:////app/chinook.db"
 export API_TOKEN="$(openssl rand -hex 32)"
-docker compose -f docker-compose.production.yml up -d --build
+docker compose \
+  -f docker-compose.production.yml \
+  -f docker-compose.sqlite.yml \
+  up -d --build
 ```
 
 Open:
@@ -331,7 +362,17 @@ container volume mapping.
 ### 7.3 Validate Compose before starting
 
 ```bash
+export DATABASE_URL="sqlite:////app/chinook.db"
+export API_TOKEN="local-test-token"
 docker compose -f docker-compose.production.yml config --quiet
+docker compose \
+  -f docker-compose.production.yml \
+  -f docker-compose.sqlite.yml \
+  config --quiet
+docker compose \
+  -f docker-compose.production.yml \
+  -f docker-compose.https.yml \
+  config --quiet
 docker build -t db-agent-local .
 ```
 
@@ -417,6 +458,18 @@ Uvicorn for the full logged exception, then run these checks:
 curl -sS http://127.0.0.1:11434/api/tags
 ollama list
 curl -sS http://127.0.0.1:8000/health/ready
+```
+
+Readiness now checks the application, database, and configured LLM model. A
+503 response is expected when any dependency is unavailable. The response
+identifies only the dependency state, not credentials or connection strings.
+
+Every request receives an `X-Request-ID` response header. Supply your own ID
+when correlating a client request with server logs:
+
+```bash
+curl -i -sS http://127.0.0.1:8000/health/live \
+  -H "X-Request-ID: demo-health-check-001"
 ```
 
 If Ollama is unavailable:

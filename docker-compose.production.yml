@@ -12,8 +12,7 @@ services:
       MAX_CONCURRENCY: ${MAX_CONCURRENCY:-4}
       REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-120}
       MAX_TOKENS: ${MAX_TOKENS:-512}
-    volumes:
-      - ./chinook.db:/app/chinook.db:ro
+      HEALTH_TIMEOUT_SECONDS: ${HEALTH_TIMEOUT_SECONDS:-3}
     depends_on:
       ollama-model-init:
         condition: service_completed_successfully

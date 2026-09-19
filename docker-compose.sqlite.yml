@@ -1,0 +1,4 @@
+services:
+  agent:
+    volumes:
+      - ./chinook.db:/app/chinook.db:ro
