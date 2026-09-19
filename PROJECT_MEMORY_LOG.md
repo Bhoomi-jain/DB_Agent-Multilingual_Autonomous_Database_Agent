@@ -8,6 +8,8 @@ under test, and exactly what changed in the codebase as a result.
 Companion files, each with a distinct job:
 - [WRONG_ANSWERS.md](WRONG_ANSWERS.md) — per-test ledger + per-bug evidence
   (what happened; append-only)
+- [DEPLOYMENT.md](DEPLOYMENT.md) — exact API, browser UI, Docker, Ollama,
+  database, troubleshooting, and validation commands
 - [PROJECT_HANDOFF.md](PROJECT_HANDOFF.md) — architecture rationale + the
   §3 compendium where landed fixes are documented for posterity
 - [failure_taxonomy.py](failure_taxonomy.py) — slug registry joining bugs ↔
@@ -17,6 +19,41 @@ Companion files, each with a distinct job:
 written at the time of the event. Fields in every entry: DISCOVERED · WHY ·
 USED · SOLVED/HOW · VERIFIED · SYSTEM BEHAVIOR · CHANGES. Never rewrite old
 entries; corrections are appended footnotes.
+
+## Deployment documentation — 2026-09-20
+
+- **DISCOVERED:** The application had a working FastAPI API and browser UI, but
+  the operational instructions were spread across conversational steps. Users
+  were confusing the placeholder database URL, the API bearer token, the
+  browser UI, the Swagger UI, local Ollama, and Docker's separate Ollama
+  network.
+- **WHY:** API-only execution, browser execution, and Docker execution have
+  different paths and different filesystem/network assumptions. In Docker,
+  `sqlite:////app/chinook.db` requires a read-only volume mount, and the API
+  must use `http://ollama:11434` rather than the host's
+  `127.0.0.1:11434`.
+- **USED:** API startup with Uvicorn; `/health/live` and `/health/ready`;
+  authenticated `curl` requests; `ps -ef`; `ollama --version`; `ollama list`;
+  `curl http://127.0.0.1:11434/api/tags`; Python SQLite cross-checks;
+  `python -m py_compile`; `uv lock`; `uv sync`; `python run_tests.py`;
+  `docker compose config --quiet`; `docker build`; `git diff --check`; and
+  FastAPI `TestClient` smoke checks.
+- **SOLVED/HOW:** Added `DEPLOYMENT.md` with separate exact procedures for
+  API-only, browser UI, Docker, local Ollama, production PostgreSQL/MySQL,
+  SQLite demo, authentication, health checks, troubleshooting, and cleanup.
+  Added a read-only `chinook.db` mount to the Compose API service and linked
+  the deployment guide from the README, test setup guide, and handoff.
+- **VERIFIED:** The API/UI smoke checks passed, the full 23/23 regression suite
+  passed, the local API returned correct Chinook answers for counts, rankings,
+  revenue, listings, and multilingual input, and the Docker image built
+  successfully.
+- **SYSTEM BEHAVIOR:** Missing authentication returns 401; missing Ollama
+  causes a query failure while readiness can still be true; a running
+  `llama3.2:latest` model allows the API to answer; Docker persists the model
+  in the `ollama_data` volume.
+- **CHANGES:** New `DEPLOYMENT.md`; README, SETUP_TESTS.md,
+  PROJECT_HANDOFF.md, and PROJECT_MEMORY_LOG.md deployment references; Compose
+  SQLite read-only mount.
 
 ---
 

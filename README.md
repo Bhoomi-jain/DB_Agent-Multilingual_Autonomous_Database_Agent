@@ -124,9 +124,34 @@ Useful flags: `--provider ollama|anthropic`, `--model`, `--max-retries`, `--no-c
 
 The bundled `chinook.db` is the classic [Chinook](https://github.com/lerocha/chinook-database) digital-media-store sample (gitignored — download with `curl -L -o chinook.db https://github.com/lerocha/chinook-database/raw/master/ChinookDatabase/DataSources/Chinook_Sqlite.sqlite`).
 
+## Production deployment
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the complete API-only, browser UI,
+Docker, Ollama, database URL, troubleshooting, and validation instructions.
+
+The repository includes a read-only HTTP API and a Docker Compose deployment using
+local Ollama, so no paid LLM API key is required:
+
+```bash
+export DATABASE_URL="postgresql+psycopg2://agent_readonly:password@host:5432/appdb"
+export API_TOKEN="$(openssl rand -hex 32)"
+docker compose -f docker-compose.production.yml up -d --build
+```
+
+The first startup downloads `llama3.2:latest` into the persistent Ollama volume.
+The browser UI is available at `GET /`. The API is available at `POST /v1/query`; send
+`Authorization: Bearer $API_TOKEN` and JSON such as
+`{"question":"Which customers spent the most?"}`. Health endpoints are
+`/health/live` and `/health/ready`.
+
+For production, use a dedicated database role with SELECT-only permissions,
+keep the API behind HTTPS and an identity-aware proxy, and do not expose
+`DATABASE_URL` or arbitrary database URLs in request payloads. The Ollama
+container should run on a host with sufficient CPU/RAM or GPU capacity.
+
 ## Testing
 
-The suite (22 scripts) runs each test in its own subprocess against real databases — no mocked DB layer — using scripted fake LLMs so tests are deterministic:
+The suite (23 scripts) runs each test in its own subprocess against real databases — no mocked DB layer — using scripted fake LLMs so tests are deterministic. DSNs are centralized in `db_targets.py` and env-overridable, so no test hardcodes a connection string:
 
 ```bash
 # One-time: create + seed the fixture databases the suite expects
@@ -142,7 +167,11 @@ Connection targets are centralized in `db_targets.py` and overridable without ed
 export DB_AGENT_PG_URL="postgresql+psycopg2://user:pass@localhost/testdb"
 ```
 
-Fresh-machine setup details (Postgres auth, MariaDB, pg_hba): see [SETUP_TESTS.md](SETUP_TESTS.md). Project history and design rationale: see [PROJECT_HANDOFF.md](PROJECT_HANDOFF.md).
+Four of the 23 tests are pure-unit (no DB server needed); the rest are
+end-to-end against Postgres (15), SQLite (3), or MySQL-else-Postgres
+fallback (`test_cache.py`). Fresh-machine setup details (Postgres auth,
+MariaDB, pg_hba): see [SETUP_TESTS.md](SETUP_TESTS.md). Project history and
+design rationale: see [PROJECT_HANDOFF.md](PROJECT_HANDOFF.md).
 
 ## Measuring accuracy
 
@@ -170,9 +199,11 @@ Every question is classified on failure (join / grain / aggregation / column-hal
 ├── core_agent.py          # Explicit text-to-SQL control loop + repair pipeline + CLI
 ├── sql_semantics.py       # Grain inference, measure-source resolution, semantic diff
 ├── schema_profile.py      # Statistical DB model: column stats, 1:N edges, ranges
+├── failure_taxonomy.py    # Slug registry: observed bugs ↔ fixes ↔ FailureClass
 ├── multilingual.py        # Language detect/translate wrapper around SQLAgent + CLI
 ├── hybrid_agent.py        # RAG+SQL router: sql / semantic / hybrid + CLI
 ├── production_agent.py    # Agentic (create_agent) variant, LLM factory shared by all
+├── agent.py               # Original v0.1 ReAct loop — DEPRECATED, kept for reference
 ├── db_mcp_server.py       # Security-reviewed read-only MCP server (AST validated)
 ├── vector_store.py        # chromadb-backed semantic store, pluggable embedders
 ├── benchmark.py           # Accuracy harness: exact-match / exec-accuracy / retry /
@@ -181,9 +212,12 @@ Every question is classified on failure (join / grain / aggregation / column-hal
 ├── db_targets.py          # Central, env-overridable test DSNs
 ├── seed_testdb.py         # Recreates the baseline test fixture (self-checking)
 ├── run_tests.py           # Suite runner: subprocess isolation + report generation
+├── tests/test_*.py        # 23 self-contained end-to-end tests (in tests/)
 ├── SETUP_TESTS.md         # Fresh-machine environment setup guide
+├── DEPLOYMENT.md          # API, browser UI, Docker, Ollama, and troubleshooting
 ├── PROJECT_HANDOFF.md     # Design decisions, bug-history compendium, roadmap
-├── test_*.py              # 22 self-contained end-to-end tests
+├── PROJECT_MEMORY_LOG.md  # Running bug/history log — one ML-nnn entry per bug/fix
+├── WRONG_ANSWERS.md       # Live-answer ledger + per-bug evidence (append-only)
 ├── chinook.db             # Sample DB (gitignored)
 └── pyproject.toml / uv.lock
 ```

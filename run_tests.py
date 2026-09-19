@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Run every test_*.py in this directory and write one pasteable report.
+Run every test_*.py in ./tests and write one pasteable report.
 
-Drop this file in your project root (next to core_agent.py) and run:
+Drop this file in your project root (next to core_agent.py and the
+tests/ folder) and run:
 
     uv run python run_tests.py           # or: python run_tests.py
 
@@ -21,6 +22,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+TEST_DIR = os.path.join(HERE, "tests")
 REPORT = os.path.join(HERE, "test_report.txt")
 CACHE_FILE = os.path.join(HERE, ".schema_cache.json")
 
@@ -74,7 +76,7 @@ def preflight():
 
 
 def discover():
-    found = sorted(os.path.basename(p) for p in glob.glob(os.path.join(HERE, "test_*.py")))
+    found = sorted(os.path.basename(p) for p in glob.glob(os.path.join(TEST_DIR, "test_*.py")))
     first = [t for t in PREFERRED_FIRST if t in found]
     return first + [t for t in found if t not in first]
 
@@ -162,10 +164,12 @@ def main():
     for name in tests:
         cleared = [] if args.keep_cache else clear_cache()
         print(f"--- running {name} ...", flush=True)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = HERE + ("".join([os.pathsep, env["PYTHONPATH"]]) if env.get("PYTHONPATH") else "")
         try:
             proc = subprocess.run(
-                [sys.executable, name],
-                cwd=HERE, capture_output=True, text=True, timeout=args.timeout,
+                [sys.executable, os.path.join(TEST_DIR, name)],
+                cwd=HERE, env=env, capture_output=True, text=True, timeout=args.timeout,
             )
             status = classify(proc)
             stdout, stderr = proc.stdout, proc.stderr

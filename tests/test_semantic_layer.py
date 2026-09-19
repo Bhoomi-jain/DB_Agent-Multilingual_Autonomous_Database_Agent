@@ -1,10 +1,11 @@
 import asyncio
+import os
 
 import sqlglot
 from sqlglot import exp
 
 from core_agent import SQLAgent, Metrics, _resolve_table_aliases, \
-    apply_measure_optimization, SemanticValidationError
+    apply_measure_optimization, SemanticValidationError, CACHE_FILE
 from sql_semantics import classify_grains, infer_question_grain, \
     build_fk_maps, semantic_diff, summarize_diff, descendants
 from sqlalchemy import create_engine, text
@@ -185,11 +186,8 @@ async def test_learn_then_optimize():
     print("=== retry pair teaches Invoice.Total == SUM(amount*quantity) ===")
     # Cache isolation: earlier runs may have already persisted this
     # equivalence; this scenario must observe the LEARNING event itself.
-    import os
-    cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              ".schema_cache.json")
-    if os.path.exists(cache_file):
-        os.remove(cache_file)
+    if os.path.exists(CACHE_FILE):
+        os.remove(CACHE_FILE)
 
     # Run A: detail-arithmetic attempt rejected by the plan's column check,
     # header-total attempt succeeds -> paired probe learns the equivalence.

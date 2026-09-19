@@ -1,0 +1,48 @@
+services:
+  agent:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      LLM_PROVIDER: ollama
+      LLM_MODEL: ${LLM_MODEL:-llama3.2:latest}
+      OLLAMA_BASE_URL: http://ollama:11434
+      API_TOKEN: ${API_TOKEN}
+      MAX_CONCURRENCY: ${MAX_CONCURRENCY:-4}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-120}
+      MAX_TOKENS: ${MAX_TOKENS:-512}
+    volumes:
+      - ./chinook.db:/app/chinook.db:ro
+    depends_on:
+      ollama-model-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  ollama-model-init:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      LLM_MODEL: ${LLM_MODEL:-llama3.2:latest}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["until ollama list >/dev/null 2>&1; do sleep 2; done; ollama pull $${LLM_MODEL:-llama3.2:latest}"]
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: "no"
+
+volumes:
+  ollama_data:

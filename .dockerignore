@@ -1,0 +1,14 @@
+.git
+.venv
+__pycache__
+*.py[cod]
+.env
+.schema_cache*
+test_report.txt
+tests
+benchmark
+master.zip
+pagila-master
+chinook.db
+test_sqlite.db
+tutorial.ipynb

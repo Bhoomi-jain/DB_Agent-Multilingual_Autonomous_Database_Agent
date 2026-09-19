@@ -1,5 +1,9 @@
 # Getting the db-agent test suite running on a fresh machine
 
+For running the application API, browser UI, Ollama, or Docker deployment,
+read [DEPLOYMENT.md](DEPLOYMENT.md). This file is only for the test fixtures
+and the 23-script regression suite.
+
 Your run produced `0/14 passed`, but **none of those failures were code bugs** —
 no test got far enough to execute a single line of the repair pipeline. Three
 environment problems account for all fourteen.
@@ -11,17 +15,19 @@ environment problems account for all fourteen.
 | No seeded `test_sqlite.db` → `no such table: customers` | 1 (`test_sqlite_repro.py`) |
 
 Underneath all three is one root gap: **the baseline `customers` / `orders` /
-`order_items` schema was seeded by hand in the old dev sandbox
-(PROJECT_HANDOFF.md §7) and no seed script was ever committed.** On a fresh
-machine there is nothing to seed it. `seed_testdb.py` fills that gap.
+`order_items` schema used to be seeded by hand in the old dev sandbox and no
+seed script was ever committed.** On a fresh machine there is nothing to seed
+it. `seed_testdb.py` fills that gap.
 
 ---
 
-## 1. Point Postgres at the DSN the tests hardcode
+## 1. Point Postgres at the DSN the suite expects
 
-The DSN `postgresql+psycopg2://postgres:postgres@localhost/testdb` is
-hardcoded in 12 test files, so the lowest-friction fix is to make the server
-match it rather than edit twelve files:
+All connection strings are centralized in `db_targets.py` and env-overridable
+(`DB_AGENT_PG_URL` / `DB_AGENT_MYSQL_URL` / `DB_AGENT_SQLITE_URL`); every test
+and `seed_testdb.py` imports from there, so nothing is hardcoded in test files.
+The default is `postgresql+psycopg2://postgres:postgres@localhost/testdb`, and
+the lowest-friction fix is to make the server match it:
 
 ```bash
 sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
@@ -32,21 +38,12 @@ If local connections are still refused after setting the password, `pg_hba.conf`
 is likely set to `peer` or `ident` for local TCP. Change the `127.0.0.1/32` and
 `::1/128` lines to `scram-sha-256` and `sudo systemctl reload postgresql`.
 
-Prefer not to touch the server? Export a DSN instead — but note the tests
-themselves still hardcode theirs, so this only affects `seed_testdb.py`:
+Prefer not to touch the server? Export a DSN instead — the whole suite (tests
+and `seed_testdb.py`) honors it because everything reads from `db_targets.py`:
 
 ```bash
 export DB_AGENT_PG_URL="postgresql+psycopg2://youruser:yourpass@localhost/testdb"
 ```
-
-To make the *tests* honour it too, replace the literal in each file:
-
-```bash
-sed -i 's|"postgresql+psycopg2://postgres:postgres@localhost/testdb"|os.getenv("DB_AGENT_PG_URL", "postgresql+psycopg2://postgres:postgres@localhost/testdb")|' test_*.py
-```
-
-(Then add `import os` where it's missing. I'd rather do this properly as a
-shared `db_targets.py` module than by `sed` — say the word.)
 
 ## 2. Start MariaDB (only `test_cache.py` needs it)
 

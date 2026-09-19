@@ -54,19 +54,23 @@ def build_llm(provider: str, model: str | None, reasoning: bool = False, max_tok
     provider = provider.lower()
     if provider == "ollama":
         from langchain_ollama import ChatOllama
-        return ChatOllama(
-            model=model or "llama3.2:latest",
-            temperature=0,
+        kwargs = {
+            "model": model or "llama3.2:latest",
+            "temperature": 0,
             # reasoning=False maps to Ollama's "think": false API field, but
             # whether the model HONORS it is model-dependent: thinking models
             # like Qwen3 have been observed emitting <think> reasoning anyway
             # (stripped defensively in core_agent._strip_thinking), while
             # Llama 3.2 has no thinking mode at all and ignores it harmlessly.
-            reasoning=reasoning,
+            "reasoning": reasoning,
             # Caps worst-case generation length so a model that starts
             # rambling can't turn one call into a multi-minute stall.
-            num_predict=max_tokens,
-        )
+            "num_predict": max_tokens,
+        }
+        ollama_base_url = os.getenv("OLLAMA_BASE_URL")
+        if ollama_base_url:
+            kwargs["base_url"] = ollama_base_url
+        return ChatOllama(**kwargs)
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
         if not os.getenv("ANTHROPIC_API_KEY"):

@@ -10,12 +10,14 @@ alongside this file.
 
 ## 1. Status snapshot
 
-**Working state:** the full test suite passes — 22/22 end-to-end tests
+**Working state:** the full test suite passes — 23/23 end-to-end tests
 against live database servers (`python run_tests.py`, report written to
 `test_report.txt`). Postgres is required by most tests; MySQL only by
 `test_cache.py` (which now falls back to Postgres when MariaDB is down);
 SQLite by `test_multilingual.py`, `test_sqlite_repro.py` and
-`test_metric_mismatch.py`.
+`test_metric_mismatch.py`; four tests (`test_column_validation.py`,
+`test_dialect_repairs.py`, `test_query_plan.py`, `test_live_regressions.py`)
+are pure-unit and need no server.
 
 **Entry points, newest to oldest:**
 
@@ -224,7 +226,9 @@ sentences are deliberately exempt.
 `run_tests.py` executes each `test_*.py` in its own subprocess (one crash
 can't take down the rest), clears `.schema_cache.json` first, classifies
 failures (assert vs error vs timeout), recognizes known setup problems, and
-writes a pasteable `test_report.txt`.
+writes a pasteable `test_report.txt`. Tests live in `tests/` (the runner
+points `PYTHONPATH` at the repo root so they can import `core_agent`,
+`db_targets`, etc.).
 
 Tests are end-to-end against REAL databases — no mocked DB layer. The LLM
 is scripted (`FakeLLM` pops pre-written responses in order), which makes
@@ -275,7 +279,11 @@ up and falls back to Postgres otherwise.
 - Fresh-machine setup (Postgres auth, pg_hba, MariaDB, seeding): SETUP_TESTS.md
 - Fixture seeding with self-check: `python seed_testdb.py --target all`
 - Full suite: `python run_tests.py` → `test_report.txt`
-- Service expectations: PostgreSQL :5432 reachable for 13 tests; MySQL :3306 optional; Ollama :11434 only for live-model runs; ChromaDB runs embedded (no server, no port)
+- Service expectations: PostgreSQL :5432 reachable for 15 tests (plus
+  `test_cache.py`'s fallback); MySQL :3306 optional (only `test_cache.py`,
+  and only when it's up); SQLite used by 3 tests (local file, no server);
+  4 pure-unit tests need none; Ollama :11434 only for live-model runs;
+  ChromaDB runs embedded (no server, no port)
 
 ---
 
@@ -301,3 +309,9 @@ up and falls back to Postgres otherwise.
    widen the gold set and sweep models (qwen3 vs llama3.2).
 7. **Embedding provider parity**: exercise the Ollama embedding path with a
    live-model test once a CI runner can host one.
+8. **Deployment surface (landed)**: `api.py` exposes the explicit read-only
+   pipeline through FastAPI, serves the browser UI from `static/index.html`,
+   and provides `/health/live`, `/health/ready`, and `/v1/query`. The local
+   default is Ollama with `llama3.2:latest`; Docker Compose runs the API and
+   Ollama together. Full operator instructions, exact commands, failure
+   diagnosis, and the API/UI/Docker distinction are in `DEPLOYMENT.md`.
