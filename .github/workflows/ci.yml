@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d testdb"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: testdb
+          MYSQL_USER: test
+          MYSQL_PASSWORD: test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Compile Python sources
+        run: uv run python -m py_compile *.py tests/*.py
+
+      - name: Seed test databases
+        env:
+          DB_AGENT_PG_URL: postgresql+psycopg2://postgres:postgres@127.0.0.1:5432/testdb
+          DB_AGENT_MYSQL_URL: mysql+pymysql://test:test@127.0.0.1:3306/testdb
+          DB_AGENT_SQLITE_URL: sqlite:///test_sqlite.db
+        run: uv run python seed_testdb.py --target all
+
+      - name: Run regression suite
+        env:
+          DB_AGENT_PG_URL: postgresql+psycopg2://postgres:postgres@127.0.0.1:5432/testdb
+          DB_AGENT_MYSQL_URL: mysql+pymysql://test:test@127.0.0.1:3306/testdb
+          DB_AGENT_SQLITE_URL: sqlite:///test_sqlite.db
+        run: uv run python run_tests.py
+
+      - name: Validate Compose configurations
+        env:
+          DATABASE_URL: sqlite:////tmp/chinook.db
+          API_TOKEN: ci-test-token
+          DOMAIN: example.com
+        run: |
+          docker compose -f docker-compose.production.yml config --quiet
+          docker compose \
+            -f docker-compose.production.yml \
+            -f docker-compose.sqlite.yml \
+            config --quiet
+          docker compose \
+            -f docker-compose.production.yml \
+            -f docker-compose.https.yml \
+            config --quiet
+
+      - name: Build Docker image
+        run: docker build --tag db-agent-ci .
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: test_report.txt
+          if-no-files-found: ignore

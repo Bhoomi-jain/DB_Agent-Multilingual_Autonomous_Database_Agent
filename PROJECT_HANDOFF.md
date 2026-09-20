@@ -292,9 +292,12 @@ up and falls back to Postgres otherwise.
 
 ## 6. Roadmap — suggested next steps
 
-1. **CI**: `.github/` is empty. A workflow installing deps + starting
-   postgres service containers + `python seed_testdb.py && python run_tests.py`
-   would lock in the currently-manual verification loop.
+1. **CI**: `.github/workflows/ci.yml` now installs the locked dependencies,
+   starts PostgreSQL and MySQL service containers, seeds PostgreSQL/MySQL/
+   SQLite fixtures, compiles Python sources, runs `python run_tests.py`,
+   validates the Compose configurations, builds the production image, and
+   uploads `test_report.txt`. Database-matrix separation and release checks
+   remain future Priority 1 work.
 2. **pytest migration**: keep scripts runnable standalone but add pytest
    wrappers/fixtures so IDEs and standard tooling can collect them.
 3. **Commit hygiene**: working tree carries the Phase-2 fixes (cosine space,

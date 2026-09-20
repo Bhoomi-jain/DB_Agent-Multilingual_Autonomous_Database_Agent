@@ -88,15 +88,15 @@ real customer data.
 
 ### P1.1 Add GitHub Actions CI
 
-- [ ] Create `.github/workflows/ci.yml`.
-- [ ] Run on pushes and pull requests.
-- [ ] Use Python 3.11, matching the supported runtime.
-- [ ] Install from `uv.lock`.
-- [ ] Run syntax compilation.
-- [ ] Run the full `python run_tests.py` suite.
-- [ ] Upload `test_report.txt` as a workflow artifact.
-- [ ] Build the production Docker image.
-- [ ] Validate `docker-compose.production.yml`.
+- [x] Create `.github/workflows/ci.yml`.
+- [x] Run on pushes and pull requests.
+- [x] Use Python 3.11, matching the supported runtime.
+- [x] Install from `uv.lock`.
+- [x] Run syntax compilation.
+- [x] Run the full `python run_tests.py` suite.
+- [x] Upload `test_report.txt` as a workflow artifact.
+- [x] Build the production Docker image.
+- [x] Validate `docker-compose.production.yml`.
 
 **Acceptance criteria**
 
