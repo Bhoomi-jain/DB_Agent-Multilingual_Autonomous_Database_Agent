@@ -9,7 +9,7 @@ Every LLM call and tool call happens exactly where the code says it does, in the
 
 ## DEMO
 
-[![Watch Demo](https://youtu.be/JPZv42zNbMk)]
+[![Watch Demo](https://img.youtube.com/vi/JPZv42zNbMk/0.jpg)](https://www.youtube.com/watch?v=JPZv42zNbMk)
 
 ## Features
 
