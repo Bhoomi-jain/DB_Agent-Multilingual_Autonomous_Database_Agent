@@ -7,6 +7,10 @@ A natural-language-to-SQL query agent with an **explicit, inspectable control lo
 
 Every LLM call and tool call happens exactly where the code says it does, in the order it says, with metrics to prove it. Wrong SQL is not just retried — whole classes of mistakes are **detected and repaired deterministically** before they ever reach the database.
 
+## DEMO
+
+[![Watch Demo]([https://img.youtube.com/vi/VIDEO_ID/0.jpg](https://youtu.be/JPZv42zNbMk))]
+
 ## Features
 
 - **Explicit control loop** (`core_agent.py`) — schema discovery → table picking → SQL generation → validation → execution → bounded retry → answer formatting. Happy path = 3 LLM calls, regardless of database size.
